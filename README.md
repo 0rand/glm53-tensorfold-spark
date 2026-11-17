@@ -4,6 +4,8 @@ Support me here: https://buymeacoffee.com/jayleaton
 
 # GLM-5.3-Flash on TensorFold, 2x NVIDIA DGX Spark
 
+Fork notes: [0rand changes, local production tuning and benchmark results](REAMDE-0rand.md).
+
 Serve GLM-5.3-Flash (the abliterated EXL3 4-bit checkpoint
 [`neko-legends/GLM-5.3-Flash-Uncensored-EXL3`](https://huggingface.co/neko-legends/GLM-5.3-Flash-Uncensored-EXL3))
 across two NVIDIA DGX Sparks, tensor-parallel over the 200 Gb/s CX7 link, behind an OpenAI-compatible API. The
