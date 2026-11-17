@@ -17,10 +17,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts"))
+from image_name import fork_image
+
 KIT = Path(os.environ.get("VLLM_KIT_DIR", str(Path.home() / "ai/src/glm53-exl3-2x-kit")))
 LINK_IF = os.environ.get("RIGMARK_LINK_IF", "enp1s0f1np1")
 MODEL = "neko-legends/GLM-5.3-Flash-Uncensored-EXL3"
@@ -132,6 +136,7 @@ def tensorfold(config: Path) -> dict:
     for k in keys:      # serve.sh: a non-empty caller export wins over the config file
         if os.environ.get(k):
             e[k] = os.environ[k]
+    image = fork_image(e.get("IMAGE", ""))
     vendor = sh("git", "-C", str(REPO / "vendor/TensorFold"), "rev-parse", "--short=7", "HEAD") or "2f8e514"
     repo = sh("git", "-C", str(REPO), "rev-parse", "--short=12", "HEAD") or "unknown (not a git checkout)"
     nonexpert = e.get("GLM53_TF_NONEXPERT", "bf16")
@@ -146,7 +151,7 @@ def tensorfold(config: Path) -> dict:
                              if e.get("GLM53_TF_KV_POOL_TOKENS") else ""),
         "serving_engine": f"TensorFold {vendor} + glm53-tensorfold-spark engine patches (repo {repo}; "
                           f"config/prod.env), OpenAI server from tensorfold.cuda.server",
-        "serving_image": image_id(e.get("IMAGE", "")),
+        "serving_image": image_id(image),
         "drafter": f"{DRAFTER}@{snapshot_rev(e.get('DRAFTER', ''))[:12]} + MTP head, cost-derived depth "
                    f"({e.get('GLM53_TF_DEPTH', '?')}), up to {e.get('GLM53_TF_AUTO_FDRAFTS', '?')} drafts, verify "
                    f"windows up to {e.get('GLM53_TF_MAX_DRAFT_ROWS', '8')} rows, suffix lookup "

@@ -8,7 +8,8 @@
 #   scripts/prepare.sh --force    rewrite them
 #   scripts/prepare.sh status     list the prepared folders on both nodes
 #
-# Same config as scripts/serve.sh (config/prod.env, CONFIG=path, caller exports win). A folder is keyed by the
+# Same config as scripts/serve.sh (config/prod.env, CONFIG=path, caller exports win). Mutable IMAGE references are
+# selected for this branch after that resolution; digest-pinned refs stay unchanged. A folder is keyed by the
 # checkpoint, the rank, GLM53_TF_NONEXPERT, torch and the source of the weight-building code, so prepare with the
 # IMAGE and GLM53_TF_NONEXPERT you serve with; a start with another key ignores the folder (and, with
 # GLM53_TF_PREPARED_WRITE=1, serve.sh's default, writes its own after loading from the checkpoint).
@@ -32,7 +33,7 @@ for _k in WORKER_SSH HEAD_IP HEAD_HF WORKER_HF MODEL_PATH; do
 done
 
 NAME="${NAME:-glm53-tf}"
-IMAGE="${IMAGE:-glm53-tensorfold:dev}"
+IMAGE="$(python3 scripts/image_name.py "${IMAGE:-}")"
 HEAD_PREPARED="${HEAD_PREPARED:-${HEAD_HF%/*}/glm53-tf/prepared}"
 WORKER_PREPARED="${WORKER_PREPARED:-${WORKER_HF%/*}/glm53-tf/prepared}"
 log() { echo "[glm53-tf prepare] $(date '+%F %T') $*"; }

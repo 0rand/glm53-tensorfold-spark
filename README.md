@@ -288,7 +288,7 @@ hf download incoai/GLM-5.3-Flash-DFlash2 --revision 7d74cdd881ed7e32c31175984a67
 **On the head node:**
 
 ```bash
-git clone --recurse-submodules https://github.com/jayleaton/glm53-tensorfold-spark
+git clone --recurse-submodules --branch main-0rand https://github.com/0rand/glm53-tensorfold-spark
 cd glm53-tensorfold-spark
 cp config/prod.env.example config/prod.env
 $EDITOR config/prod.env
@@ -312,6 +312,12 @@ scripts/serve.sh start       # first start: 8+ min (compiles kernels, loads, wri
 ```
 
 `serve.sh` reads `config/prod.env` by default; no `CONFIG=` needed.
+
+On `main-0rand`, build, worker transfer, preparation and launch use `glm53-tensorfold:dev-0rand`.
+Keep `IMAGE=glm53-tensorfold:dev` in the ignored config: this branch adds the suffix after reading it, while
+the unchanged `main` launcher uses the original tag. Neither version is pruned automatically. Container names,
+ports and cache/session paths remain shared; stop the pair before changing the running version.
+See [branch images and rollback](docs/TRYING.md#branch-images-and-rollback) for the switch procedure and Compose wrapper.
 
 **Verify:**
 
@@ -658,7 +664,7 @@ Other negatives and trade-offs, measured:
 The patch tests run in the image on one GPU with TensorFold's synthetic checkpoint (no real weights):
 
 ```bash
-docker run --rm --gpus all -e PYTHONDONTWRITEBYTECODE=1 -v $PWD:/work --entrypoint bash glm53-tensorfold:dev \
+docker run --rm --gpus all -e PYTHONDONTWRITEBYTECODE=1 -v $PWD:/work --entrypoint bash glm53-tensorfold:dev-0rand \
     -c "bash /work/scripts/run_tests_in_image.sh /work/results/tests -- tests/cuda/test_patches.py tests/test_glm_tool_calls.py"
 ```
 

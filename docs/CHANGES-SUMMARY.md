@@ -16,6 +16,18 @@ kernel timings, a microbenchmark or arithmetic, not an end-to-end A/B. **Status*
 configs (`config/prod*.env.example`); *batch* = on in the batch configs (production and 4 x 256k) only; *single* = single-stream config only;
 *opt-in* = off unless you set it; *rejected* = tried, measured, left off; *superseded* / *tool* as noted.
 
+## Branch image isolation (2026-11-17)
+
+- `main-0rand` resolves configured/caller image tags to `-0rand` for build, worker transfer, preparation, serving
+  and TensorFold benchmark metadata. The ignored config retains its original base reference for `main` rollback.
+- Added `scripts/compose.sh`; raw Compose requires its resolved image rather than silently rebuilding an old tag.
+- Container status includes the actual image. Names, ports and mutable cache/session paths are unchanged.
+- Real Compose rendering selected the fork tag. An isolated smoke with stateful Docker/SSH substitutes exercised
+  build/copy/start and then the actual `main` launcher: both original node image identities were preserved and
+  rollback used the unchanged config without rebuilding. No real images were built, replaced or deleted.
+- Focused image policy, Compose and launcher regression run: 67 passed. One installed AnyIO pytest-plugin
+  deprecation warning; no product failures.
+
 ## Metrics enhancement (2026-11-17, patch 0710)
 
 - Added EngineMetrics-native request counters, five latency histograms and published scheduler/KV/RAM snapshots,

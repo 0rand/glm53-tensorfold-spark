@@ -12,7 +12,8 @@
 #                               non-zero when a node is degraded or was recently slow: gate benchmark runs on it
 #
 # Configuration: config/prod.env, the production config (cp config/prod.env.example config/prod.env and fill it in).
-# CONFIG=path reads another file, e.g. CONFIG=config/minimal.env for the 32k debugging baseline.
+# CONFIG=path reads another file, e.g. CONFIG=config/minimal.env for the 32k debugging baseline. Mutable IMAGE
+# references are selected for this branch after config and caller-environment resolution; digest-pinned refs stay unchanged.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 CONFIG="${CONFIG:-config/prod.env}"
@@ -41,7 +42,7 @@ for _k in WORKER_SSH HEAD_IP HEAD_HF WORKER_HF MODEL_PATH; do
 done
 
 NAME="${NAME:-glm53-tf}"
-IMAGE="${IMAGE:-glm53-tensorfold:dev}"
+IMAGE="$(python3 scripts/image_name.py "${IMAGE:-}")"
 PORT="${PORT:-8080}"
 BASE="http://127.0.0.1:$PORT"
 # Every ops feature below is off unless set (config or environment); `start` / `stop` / `status` behave as before.
@@ -607,8 +608,8 @@ stop)
     log "stopped"
     ;;
 status)
-    docker ps -a --filter "name=$NAME" --format '{{.Names}} {{.Status}}'
-    wssh "docker ps -a --filter name=$NAME --format '{{.Names}} {{.Status}}'"   # one string: the remote shell re-splits args
+    docker ps -a --filter "name=$NAME" --format '{{.Names}} {{.Status}} {{.Image}}'
+    wssh "docker ps -a --filter name=$NAME --format '{{.Names}} {{.Status}} {{.Image}}'"   # one string: the remote shell re-splits args
     curl -s "$BASE/v1/models" || true; echo
     curl -s "$BASE/health" || true; echo
     ;;

@@ -3949,7 +3949,7 @@ Run inside the image (needs one GPU; does not load the real checkpoint):
 
 ```bash
 docker run --rm --gpus all -e PYTHONDONTWRITEBYTECODE=1 -v $PWD/tests:/work/tests --entrypoint bash \
-    glm53-tensorfold:dev -c "pip install -q pytest; cd /work && \
+    glm53-tensorfold:dev-0rand -c "pip install -q pytest; cd /work && \
     PYTHONPATH=/src/TensorFold/tests/cuda:/work/tests/cuda python -m pytest -q \
     tests/cuda/test_patches.py tests/test_glm_tool_calls.py /src/TensorFold/tests/cuda/test_glm_*.py"
 ```

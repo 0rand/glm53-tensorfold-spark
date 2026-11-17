@@ -1,8 +1,8 @@
 """Host-only tests of the launcher's ops paths (scripts/serve.sh, scripts/canary.py, scripts/xid.py).
 
-No GPU, no Docker, no second node: ``docker``, ``ssh``, ``nvidia-smi`` and ``journalctl`` are shell fakes on PATH
-(``ssh`` runs the remote command locally; both "nodes" share the fake Docker state), and the engine is a small HTTP
-server answering the OpenAI routes the canary and the watchdog use.
+No GPU, no Docker, no second node: ``docker``, ``ssh``, ``nvidia-smi`` and ``journalctl`` are shell fakes on PATH.
+The fake Docker store keeps image tags independently per node while the engine is a small HTTP server answering the
+OpenAI routes the canary and the watchdog use.
 
     python -m pytest -q tests/test_serve_ops.py
 """
@@ -194,14 +194,38 @@ def test_xid_cli_fail_levels():
 # -- serve.sh ----------------------------------------------------------------------------------------------------
 
 FAKE_DOCKER = r"""#!/usr/bin/env bash
-# fake docker: containers are files in $FAKE_STATE (content: true|false)
+# fake docker: containers are files in $FAKE_STATE; images are separate per fake node
 echo "docker $*" >> "$FAKE_STATE/calls"
+node="${FAKE_NODE:-head}"
+image_file() {
+    local key=${1//\//_}
+    key=${key//:/_}
+    key=${key//@/_}
+    printf '%s/image.%s.%s' "$FAKE_STATE" "$node" "$key"
+}
 case "$1" in
+build)
+    tag=""
+    for ((i = 1; i <= $#; i++)); do [[ "${!i}" == -t ]] && { j=$((i + 1)); tag="${!j}"; }; done
+    [[ -n "$tag" ]] || exit 2
+    printf 'built-%s\n' "$tag" > "$(image_file "$tag")" ;;
+save)
+    ref=$2
+    printf '%s\t%s\n' "$ref" "$(cat "$(image_file "$ref")")" ;;
+load)
+    IFS=$'\t' read -r ref iid
+    printf '%s\n' "$iid" > "$(image_file "$ref")" ;;
 run)
-    name=""; prev=""
-    for a in "$@"; do [[ "$prev" == --name ]] && name=$a; prev=$a; done
+    name=""; image=""; prev=""
+    for ((i = 1; i <= $#; i++)); do
+        [[ "${!i}" == --entrypoint ]] && { j=$((i + 2)); image="${!j}"; }
+        [[ "$prev" == --name ]] && name="${!i}"
+        prev="${!i}"
+    done
+    image="${image:-${@: -1}}"
     # the preflight's RoCE marker probe (docker run --rm ... --entrypoint test IMAGE -e MARK)
     [[ " $* " == *" --entrypoint test "* ]] && { [[ -f "$FAKE_STATE/roce-mark" ]]; exit; }
+    [[ -f "$(image_file "$image")" ]] || { echo "Error: No such image: $image" >&2; exit 1; }
     printf '%s\n' "$@" > "$FAKE_STATE/args.$name"
     echo "${FAKE_RUN_STATE:-true}" > "$FAKE_STATE/c.$name"; echo cid ;;
 rm) for n in "${@:2}"; do [[ "$n" == -f ]] || rm -f "$FAKE_STATE/c.$n"; done ;;
@@ -212,7 +236,11 @@ inspect)
         *StartedAt*) date -u -d "@$(( $(date +%s) - ${FAKE_AGE:-5000} ))" +%Y-%m-%dT%H:%M:%S.000000000Z ;;
         *) cat "$FAKE_STATE/c.$n" ;;
     esac ;;
-image) exit 0 ;;
+image)
+    ref="${@: -1}"
+    file="$(image_file "$ref")"
+    [[ -f "$file" ]] || { echo "Error: No such image: $ref" >&2; exit 1; }
+    if [[ " $* " == *" -f "* || " $* " == *" --format "* ]]; then cat "$file"; fi ;;
 logs) echo "log of ${@: -1}"
     # rank 0's boot line (patches/0290) that serve.sh's slot check reads
     [[ "${@: -1}" == *-r0 ]] && echo "[tf] context: 1048576 tokens a request, ${FAKE_SLOTS:-4} request slot(s)" ;;
@@ -221,12 +249,12 @@ esac
 """
 
 FAKE_SSH = r"""#!/usr/bin/env bash
-# fake ssh: skip options and the target, run the command here
+# fake ssh: skip options and the target, run the command locally as the worker
 echo "ssh $*" >> "$FAKE_STATE/calls"
 [[ "${FAKE_SSH_FAIL:-0}" == 1 ]] && exit 255
 while [[ "$1" == -o ]]; do shift 2; done
 shift
-exec bash -c "$*"
+exec env FAKE_NODE=worker bash -c "$*"
 """
 
 FAKE_SMI = r"""#!/usr/bin/env bash
@@ -256,7 +284,7 @@ def kit(tmp_path, engine):
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "config").mkdir()
-    for f in ("serve.sh", "canary.py", "xid.py"):
+    for f in ("serve.sh", "prepare.sh", "image_name.py", "canary.py", "xid.py"):
         shutil.copy(ROOT / "scripts" / f, repo / "scripts" / f)
     (repo / "config" / "prod.env").write_text(
         "WORKER_SSH=fake-worker\nHEAD_IP=10.0.0.1\nNCCL_SOCKET_IFNAME=eth9\nNCCL_IB_HCA=fakehca0\n"
@@ -269,26 +297,36 @@ def kit(tmp_path, engine):
         (bin_ / name).chmod(0o755)
     state = tmp_path / "state"
     state.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("GLM53_TF_", "NCCL_", "CANARY", "WATCH_",
-                                                                    "MEM_GATE", "CONTEXT"))}
+    for node in ("head", "worker"):
+        (state / f"image.{node}.fake_img-0rand").write_text("fork-default\n")
+    env = {k: v for k, v in os.environ.items() if k != "IMAGE" and not k.startswith(("GLM53_TF_", "NCCL_", "CANARY", "WATCH_",
+                                                                                       "MEM_GATE", "CONTEXT"))}
     env.update(PATH=f"{bin_}:{env['PATH']}", FAKE_STATE=str(state), PORT=str(engine.port),
-               STATE_DIR=str(tmp_path / "ops"), XDG_STATE_HOME=str(tmp_path / "xdg"))
+               STATE_DIR=str(tmp_path / "ops"), XDG_STATE_HOME=str(tmp_path / "xdg"),
+               HEAD_PREPARED=str(tmp_path / "prepared-head"), WORKER_PREPARED=str(tmp_path / "prepared-worker"),
+               HEAD_SESSIONS=str(tmp_path / "sessions-head"), WORKER_SESSIONS=str(tmp_path / "sessions-worker"))
 
     def run(*args, timeout=60, **extra):
         e = dict(env, **{k: str(v) for k, v in extra.items()})
         return subprocess.run(["bash", str(repo / "scripts/serve.sh"), *args], env=e, text=True,
                               capture_output=True, timeout=timeout)
 
-    kit = SimpleKit(run, state, tmp_path / "ops", engine)
+    def prepare(*args, timeout=60, **extra):
+        e = dict(env, **{k: str(v) for k, v in extra.items()})
+        return subprocess.run(["bash", str(repo / "scripts/prepare.sh"), *args], env=e, text=True,
+                              capture_output=True, timeout=timeout)
+
+    kit = SimpleKit(run, prepare, state, tmp_path / "ops", engine)
     kit.repo = repo
+    kit.env = env
     kit.cfg_no_head = tmp_path / "nohead.env"
     kit.cfg_no_head.write_text((repo / "config" / "prod.env").read_text().replace("HEAD_IP=10.0.0.1\n", ""))
     return kit
 
 
 class SimpleKit:
-    def __init__(self, run, state, ops, engine):
-        self.run, self.state, self.ops, self.engine = run, state, ops, engine
+    def __init__(self, run, prepare, state, ops, engine):
+        self.run, self.prepare, self.state, self.ops, self.engine = run, prepare, state, ops, engine
 
     def calls(self) -> str:
         p = self.state / "calls"
@@ -296,6 +334,12 @@ class SimpleKit:
 
     def exists(self, name: str) -> bool:
         return (self.state / f"c.{name}").exists()
+
+    def image(self, node: str, ref: str) -> Path:
+        return self.state / f"image.{node}.{ref.replace('/', '_').replace(':', '_').replace('@', '_')}"
+
+    def seed_image(self, node: str, ref: str, image_id: str) -> None:
+        self.image(node, ref).write_text(f"{image_id}\n")
 
 
 def test_start_defaults_unchanged(kit):
@@ -311,6 +355,81 @@ def test_start_defaults_unchanged(kit):
     assert not any(a.startswith("NCCL_DEBUG") for a in args)
     assert "NCCL_IB_HCA=fakehca0" in args and "GLOO_SOCKET_IFNAME=eth9" in args
     assert "MALLOC_ARENA_MAX=4" in args and "MALLOC_ARENA_MAX=4" in (kit.state / "args.glm53-tf-r1").read_text().split("\n")
+
+# -- branch image selection -------------------------------------------------------------------------------------------
+def _run_image(kit, name):
+    args = (kit.state / f"args.{name}").read_text().splitlines()
+    return args[args.index("--entrypoint") + 2] if "--entrypoint" in args else args[-1]
+
+
+def test_build_ships_fork_without_overwriting_config_image_and_start_uses_fork_id(kit):
+    original = "fake:img"
+    fork = "fake:img-0rand"
+    kit.seed_image("head", original, "original-head")
+    kit.seed_image("worker", original, "original-worker")
+
+    r = kit.run("build")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert kit.image("head", original).read_text().strip() == "original-head"
+    assert kit.image("worker", original).read_text().strip() == "original-worker"
+    assert kit.image("head", fork).read_text().strip() == "built-fake:img-0rand"
+    assert kit.image("worker", fork).read_text().strip() == "built-fake:img-0rand"
+
+    r = kit.run("start", CANARY="off")
+    assert r.returncode == 0, r.stdout + r.stderr
+    for rank in (0, 1):
+        args = (kit.state / f"args.glm53-tf-r{rank}").read_text().splitlines()
+        assert _run_image(kit, f"glm53-tf-r{rank}") == fork
+        assert "GLM53_TF_IMAGE_ID=built-fake:img-0rand" in args
+
+
+def test_image_policy_applies_after_caller_precedence_and_is_idempotent(kit):
+    fork = "registry:5000/custom:green-0rand"
+    for node in ("head", "worker"):
+        kit.seed_image(node, fork, "caller-fork")
+    r = kit.run("start", CANARY="off", IMAGE="registry:5000/custom:green")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _run_image(kit, "glm53-tf-r0") == "registry:5000/custom:green-0rand"
+
+    r = kit.run("start", CANARY="off", IMAGE="registry:5000/custom:green-0rand")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _run_image(kit, "glm53-tf-r0") == "registry:5000/custom:green-0rand"
+
+
+def test_image_policy_uses_default_when_config_omits_image(kit, tmp_path):
+    fork = "glm53-tensorfold:dev-0rand"
+    for node in ("head", "worker"):
+        kit.seed_image(node, fork, "default-fork")
+    cfg = tmp_path / "no-image.env"
+    cfg.write_text((kit.repo / "config" / "prod.env").read_text().replace("IMAGE=fake:img\n", ""))
+    r = kit.run("start", CANARY="off", CONFIG=str(cfg))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _run_image(kit, "glm53-tf-r0") == "glm53-tensorfold:dev-0rand"
+
+
+def test_prepare_uses_the_same_resolved_image_as_start(kit):
+    assert kit.run("start", CANARY="off").returncode == 0
+    serving_image = _run_image(kit, "glm53-tf-r0")
+    r = kit.prepare(HEAD_PREPARED=str(kit.state / "prepared-head"),
+                    WORKER_PREPARED=str(kit.state / "prepared-worker"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _run_image(kit, "glm53-tf-prepare-r0") == serving_image
+    assert _run_image(kit, "glm53-tf-prepare-r1") == serving_image
+
+
+def test_rigmark_records_the_fork_image_identity(kit, tmp_path):
+    kit.seed_image("head", "fake:img", "original-image-id")
+    built = kit.run("build")
+    assert built.returncode == 0, built.stdout + built.stderr
+    output = tmp_path / "metadata.json"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/rigmark/metadata.py"), "tensorfold",
+         "--config", str(kit.repo / "config/prod.env"), "--out", str(output)],
+        env=dict(kit.env, CONTEXT="1024"), text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = json.loads(output.read_text())["serving_image"]
+    assert "built-fake:img-0rand" in recorded
+    assert "original-image-id" not in recorded
 
 
 def test_malloc_arena_max_override(kit):
@@ -610,7 +729,6 @@ def test_preflight_roce_marker_and_busy_gpu(kit):
     (kit.state / "roce-mark").touch()
     r = kit.run("preflight", **roce)
     assert r.returncode == 0 and "RoCE failure marker /cache/roce-failed on the head" in r.stdout
-    assert "--entrypoint rm fake:img -f /cache/roce-failed" in r.stdout
     r = kit.run("preflight", FAKE_GPU_PIDS="4242")
     assert r.returncode == 1 and "a CUDA process is running" in r.stdout
 

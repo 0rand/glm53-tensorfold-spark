@@ -28,6 +28,8 @@ TensorFold
   Gilesco TensorFold stacks. The Python request recorder, published GLM cache snapshots and SSD lifecycle
   instrumentation are independently implemented for this repository's pinned, patched TensorFold engine.
   No kernels, inference settings or cache file formats are changed.
+  Branch launchers additionally resolve mutable image tags to -0rand for build, transfer, preparation, serving
+  and benchmark provenance; they preserve the original image tags for rollback and do not prune images.
 
 EngineMetrics consumer integration (tools/enginemetrics-glm-metrics.patch)
   The portable patch modifies EngineMetrics' TensorFold adapter; its original code and quoted diff context

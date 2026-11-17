@@ -33,6 +33,50 @@ scripts/serve.sh status      # logs 0 | logs 1 | stop | restart
 The other configs are files next to it; pass them with `CONFIG=`, e.g. `CONFIG=config/prod-single.env
 scripts/serve.sh start` (and on every other `serve.sh` command while it runs).
 
+### Branch images and rollback
+
+Keep the configured `IMAGE` as a branch-independent base reference. On `main-0rand`, `serve.sh`, `prepare.sh`
+and TensorFold benchmark metadata resolve it through `scripts/image_name.py` after caller/config precedence.
+An existing `config/prod.env` does not need editing:
+
+| Checkout | Effective default image |
+| --- | --- |
+| `main` | `glm53-tensorfold:dev` |
+| `main-0rand` | `glm53-tensorfold:dev-0rand` |
+
+Custom tags receive `-0rand` once; an already-suffixed tag is not suffixed again. Untagged references use
+`:latest-0rand`. Immutable digest references remain unchanged; Docker builds require a tag.
+Build/save/load all use the resolved reference, leaving the original image tag on both nodes intact.
+No image deletion or pruning is added; remove redundant images manually only after settling on a version.
+
+During an approved maintenance window, with any auto-healing watchdog paused for the switch:
+
+```bash
+unset IMAGE                         # avoid a caller override surviving the branch switch
+git switch main-0rand
+scripts/serve.sh build               # build/copy the fork tag; does not replace running containers
+scripts/serve.sh stop
+scripts/serve.sh preflight
+scripts/serve.sh start
+scripts/serve.sh status              # includes each container's actual image
+```
+
+Roll back without rebuilding, using the same ignored config with its original base `IMAGE`:
+
+```bash
+scripts/serve.sh stop
+unset IMAGE
+git switch main
+scripts/serve.sh start
+scripts/serve.sh status
+```
+
+Switching Git branches alone does not replace a running container. Container names, API ports, kernel caches,
+prepared folders and session paths remain shared: this is image rollback, not a snapshot of mutable cache/session
+contents, and only one serving version fits at a time. A watchdog tied to this checkout uses the checked-out
+launcher on its next heal; resume it only after the chosen version is healthy.
+
+
 ### Single-stream (524k)
 
 `config/prod-single.env.example`. One request runs at a time; the session store keeps other conversations'
@@ -80,12 +124,24 @@ set `GLM53_TF_NONEXPERT=bf16`, `GLM53_TF_PREFILL_ROWS=64`, `GLM53_TF_AUTO_FDRAFT
 and `GLM53_TF_LOOKUP=0`, or build an image with only some patches:
 
 ```bash
-docker build -f docker/Dockerfile --build-arg PATCHES="0001 0002 0003 0004" -t glm53-tensorfold:min .
+docker build -f docker/Dockerfile --build-arg PATCHES="0001 0002 0003 0004" -t glm53-tensorfold:min-0rand .
 CONFIG=config/minimal.env IMAGE=glm53-tensorfold:min scripts/serve.sh start
 ```
 
 (`serve.sh build` copies the image to the worker; with a manual `docker build`, build it on both nodes or copy it
 with `docker save | ssh <worker-ssh> docker load`.)
+
+For the Compose debugging alternative, use the branch-aware wrapper rather than invoking the YAML directly:
+
+```bash
+CONFIG=config/minimal.env scripts/compose.sh --profile rank1 up -d   # worker first
+CONFIG=config/minimal.env scripts/compose.sh --profile rank0 up -d   # then head
+```
+
+It preserves Compose's shell-environment precedence, resolves the same image policy, and supplies the required
+internal `TF_IMAGE`. Direct Compose invocation without that resolved image fails instead of rebuilding the
+unsuffixed image from an old config. This path still supports only the 32k debugging baseline, not production.
+
 
 ## 2. Talk to it
 
@@ -292,7 +348,7 @@ checks `/health` every minute and, with `WATCH_HEAL=1`, restarts both ranks afte
 | RoCE | `GLM53_TF_COMM_BACKEND=nccl` (or leave `/cache/roce-failed` in place) |
 | a W8-W10 knob (`PREFILL_PP`, `PREFIX_SHARE`, `B12X`, `MLA_EXPAND`, `DECODE_OVERLAP`, `MAX_DRAFT_ROWS`) | remove it from the config and restart; each is off by default and was adopted on its own A/B |
 | a patch | build with `--build-arg PATCHES="..."` listing the ones to keep, and `IMAGE=<tag>` |
-| everything | `scripts/serve.sh stop`; start your previous stack (vLLM kit or upstream TensorFold). Old images stay tagged; `IMAGE=<old tag> scripts/serve.sh start` |
+| everything | `scripts/serve.sh stop`; switch to `main` and `scripts/serve.sh start` as above, or start your previous serving stack. Both image versions remain tagged; this fork always suffixes mutable image tags. |
 
 Prepared folders and the kernel cache volume (`glm53-tf-cache`) are safe to delete; the next start rebuilds them.
 
