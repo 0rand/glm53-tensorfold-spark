@@ -329,6 +329,99 @@ def _files(tier):
     return (sorted(p.name for p in (tier.dir / "entries").glob("*.tfs")),
             sorted(p.name for p in (tier.dir / "pages").rglob("*.tfp")))
 
+@needs_torch
+def test_disk_telemetry_tracks_pending_commits_and_shared_files(monkeypatch, tmp_path):
+    store, st = _fake_store(tmp_path)
+    tier = store.disk
+    started, release = threading.Event(), threading.Event()
+    run_job = tier._run_job
+
+    def held_job(job, stream):
+        started.set()
+        assert release.wait(2)
+        return run_job(job, stream)
+
+    monkeypatch.setattr(tier, "_run_job", held_job)
+    ids = _toks(random.Random(31), 900)
+    _prefill_and_save(store, st, ids)
+    assert started.wait(2)
+    pending = tier.telemetry_snapshot()
+    assert pending["pending"] == 1 and pending["pending_bytes"] > 0
+    assert pending["entries"] == pending["stored_bytes"] == 0
+    assert pending["budget_used_bytes"] == tier.index.used > 0
+    release.set()
+    tier.writer.drain()
+    system = ids[:512]
+    _prefill_and_save(store, st, system + _toks(random.Random(32), 500))
+    tier.writer.drain()
+    snap = tier.telemetry_snapshot()
+    physical = sum(p.stat().st_size for p in (tier.dir / "entries").glob("*.tfs"))
+    physical += sum(p.stat().st_size for p in (tier.dir / "pages").rglob("*.tfp"))
+    assert snap["pending"] == 0 and snap["entries"] == 2 and snap["written"] == 2
+    assert snap["stored_bytes"] == physical
+    assert snap["budget_used_bytes"] == tier.index.used
+    assert snap["stored_bytes"] < sum(e.nbytes for e in tier.index.entries.values()) + sum(
+        tier.lay[e.has_mtp][1] * len(e.pages) for e in tier.index.entries.values())
+
+@needs_torch
+def test_disk_telemetry_does_not_misclassify_pending_write_eviction(monkeypatch, tmp_path):
+    store, st = _fake_store(tmp_path)
+    tier = store.disk
+    started, release = threading.Event(), threading.Event()
+    run_job = tier._run_job
+
+    def held_job(job, stream):
+        started.set()
+        assert release.wait(2)
+        return run_job(job, stream)
+
+    monkeypatch.setattr(tier, "_run_job", held_job)
+    first = _toks(random.Random(35), 900)
+    _prefill_and_save(store, st, first)
+    assert started.wait(2)
+    tier.index.budget = tier.index.used
+    _prefill_and_save(store, st, _toks(random.Random(36), 900))
+    assert len(tier.index.entries) == 1
+    release.set()
+    tier.writer.drain()
+    snap = tier.telemetry_snapshot()
+    assert snap["written"] == 2 and snap["write_failed"] == 0
+    assert snap["entries"] == 1 and snap["stored_bytes"] > 0
+
+
+@needs_torch
+def test_disk_telemetry_snapshot_does_no_filesystem_or_cuda_work(monkeypatch, tmp_path):
+    store, st = _fake_store(tmp_path)
+    tier = store.disk
+    _prefill_and_save(store, st, _toks(random.Random(33), 900))
+    tier.writer.drain()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("telemetry scrape performed work")
+
+    monkeypatch.setattr(os, "statvfs", forbidden)
+    monkeypatch.setattr(Path, "stat", forbidden)
+    monkeypatch.setattr(tier.writer, "drain", forbidden)
+    monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
+    snap = tier.telemetry_snapshot()
+    assert snap["entries"] == 1 and snap["stored_bytes"] > 0 and snap["disk_free_bytes"] > 0
+
+
+@needs_torch
+def test_disk_telemetry_counts_async_write_failure(monkeypatch, tmp_path):
+    store, st = _fake_store(tmp_path)
+    tier = store.disk
+
+    def full(*_args, **_kwargs):
+        raise OSError("full")
+
+    monkeypatch.setattr(sessdisk, "_write_file", full)
+    _prefill_and_save(store, st, _toks(random.Random(34), 900))
+    tier.writer.drain()
+    snap = tier.telemetry_snapshot()
+    assert snap["pending"] == 0 and snap["entries"] == 0
+    assert snap["written"] == 0 and snap["write_failed"] == 1
+
 
 @needs_torch
 def test_round_trip_shared_pages_and_skips(tmp_path):
@@ -392,6 +485,11 @@ def test_a_bad_file_fails_the_read_and_drops_the_entry(tmp_path, damage):
     assert _restore(store, eb) is None
     assert eb.id not in ix.entries and store.live == {} and store.stats["disk_fallbacks"] == 1
     assert tier.stats["failed_loads"] == 1 and "error" in tier.last
+    telemetry = tier.telemetry_snapshot()
+    if damage in ("page", "entry_chunk"):
+        assert telemetry["checksum_failed"] == 1 and telemetry["load_failed"] == 0
+    else:
+        assert telemetry["checksum_failed"] == 0 and telemetry["load_failed"] == 1
     tier.writer.drain()
     assert not path.exists() and not tier._page_path(eb.pages[3]).exists()
     assert tier._page_path(eb.pages[0]).exists()                # a's pages stay
@@ -450,6 +548,10 @@ def test_both_ranks_fall_back_when_one_fails(tmp_path):
         else:
             assert results[0] is None and results[1] is None                    # rank 0's read was fine
     assert stores[0][0].disk.digest() == stores[1][0].disk.digest() and len(stores[0][0].disk.index.entries) == 1
+    telemetry = [store.disk.telemetry_snapshot() for store, _ in stores]
+    assert [t["loaded_tokens"] for t in telemetry] == [len(prompts[0])] * 2
+    assert [t["restore_failed"] for t in telemetry] == [1, 1]
+    assert telemetry[0]["load_failed"] == 0 and telemetry[1]["checksum_failed"] == 1
 
 
 @needs_torch
@@ -476,6 +578,11 @@ def test_restart_indexes_the_directory(tmp_path):
     entries, pages = _files(t2)
     assert len(entries) == 4 and len(pages) == len(t2.index.pages) and not orphan.exists()
     assert not list((t2.dir / "entries").glob(".*"))
+    recovered = t2.telemetry_snapshot()
+    physical = sum(p.stat().st_size for p in (t2.dir / "entries").glob("*.tfs"))
+    physical += sum(p.stat().st_size for p in (t2.dir / "pages").rglob("*.tfp"))
+    assert recovered["entries"] == 4 and recovered["stored_bytes"] == physical
+    assert recovered["budget_used_bytes"] == t2.index.used
     for ids in prompts:
         _check_snap(_restore(store2, t2.index.has(0, ids, True, False)), ids)
         st2.check(ids, len(ids), len(ids) - 1)

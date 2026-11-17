@@ -39,6 +39,7 @@ import queue
 import socket
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -371,6 +372,8 @@ def _collector(poll=0.01):
     b = _batch()
     bat = object.__new__(b.Batcher)
     bat.cv = threading.Condition()
+    bat.queue = deque()
+    bat.g = SimpleNamespace()
     bat.poll_s = poll
     return bat
 
@@ -533,6 +536,37 @@ def test_streamed_client_gone_gets_no_final_chunk(serving):
     s.close()
     assert wait_for(lambda: eng.stopped is not None), data[-300:]
     assert b"[DONE]" not in data and b'"finish_reason": "length"' not in data
+
+
+def test_stream_role_event_does_not_start_ttft(serving):
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+
+    class Timed(Paced):
+        def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
+            clock.now = 7.0
+            return super().generate(prompt, max_tokens, sampling, on_tokens, draft=draft)
+
+    app = make_app(Timed(text="x"))
+    app.health.request_metrics.clock = clock
+    port = serving(app)
+    status, _, stream = post(port, {"messages": MESSAGES, "max_tokens": 1, "stream": True})
+    assert status == 200 and '"role": "assistant"' in stream
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=WAIT)
+    try:
+        conn.request("GET", "/metrics")
+        reply = conn.getresponse()
+        metrics = reply.read().decode()
+    finally:
+        conn.close()
+    assert reply.status == 200
+    assert "tensorfold:time_to_first_token_seconds_sum 7" in metrics
+    assert "tensorfold:time_to_first_token_seconds_count 1" in metrics
 
 
 # -- 2. request hardening ---------------------------------------------------------------------------------------------
@@ -1075,6 +1109,7 @@ def test_health_live_totals(serving):
     _, after = get(port)
     assert after["busy"] is False and after["requests_total"] == 1 and after["requests"] == 1
     assert after["completion_tokens_total"] == 4 and after["prompt_tokens_total"] > 0
+    assert after["prefilled_tokens_total"] == after["prompt_tokens_total"] - 2
     assert (after["prefill_seconds_total"], after["decode_seconds_total"]) == (0.25, 0.5)
     assert (after["rounds_total"], after["drafted_total"], after["accepted_total"], after["cached_tokens_total"]) == \
         (4, 12, 4, 2)
@@ -1101,3 +1136,26 @@ def test_health_counts_a_failed_request_and_batch_streams():
     body = h.status(app)[1]
     assert body["streams"] == {"decoding": 2, "prefilling": 1, "max": 4} and body["context_length"] == 1048576
     assert "streams" not in h.status(SimpleNamespace(engine=SimpleNamespace(batch=None)))[1]
+
+
+def test_health_consumes_the_engine_published_telemetry_snapshot():
+    h = Health(mode="basic", stall_s=0)
+
+    class Published:
+        limit = 999
+        batch = SimpleNamespace(seqs=[SimpleNamespace(stepper=None)], n=1)
+
+        def telemetry_snapshot(self):
+            return {"requests_running": 3, "requests_waiting": 4, "generation_tokens_running": 9,
+                    "streams": {"decoding": 2, "prefilling": 1, "filling": 0, "paused": 0, "max": 8},
+                    "context_length": 32768, "pool_tokens": 100, "pool_free_tokens": 25,
+                    "pool_used_tokens": 75, "pool_reserved_tokens": 10, "pool_available_tokens": 15,
+                    "kv_pool_usage_ratio": 0.75, "stream_kv_usage_ratio": 0.5,
+                    "kept_prompts": 2, "kept_bytes": 30, "session_budget_bytes": 40,
+                    "session_used_bytes": 30, "cache_restores": {"ram": {"requests": 1, "tokens": 5}},
+                    "spill": {"entries": 1, "stored_bytes": 5}}
+
+    body = h.status(SimpleNamespace(engine=Published()))[1]
+    assert body["requests_running"] == 3 and body["requests_waiting"] == 4
+    assert body["streams"]["max"] == 8 and body["context_length"] == 32768
+    assert body["pool_reserved_tokens"] == 10 and body["spill"]["stored_bytes"] == 5

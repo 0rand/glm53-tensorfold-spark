@@ -1,0 +1,1478 @@
+diff --git a/src/tensorfold/cuda/health.py b/src/tensorfold/cuda/health.py
+index 19df8916d..bb5fe240f 100644
+--- a/src/tensorfold/cuda/health.py
++++ b/src/tensorfold/cuda/health.py
+@@ -27,10 +27,11 @@ live totals under upstream's names, so pollers written for upstream (dashboards
+ ``backend``, ``busy``, ``requests_running``, ``requests_total``, ``prompt_tokens_total``, ``completion_tokens_total``
+ (finished replies plus the running replies' tokens so far: it moves as tokens are emitted), ``prefill_seconds_total``,
+ ``decode_seconds_total``, ``cached_tokens_total``, ``rounds_total``, ``drafted_total``, ``accepted_total``, and with the
+-batch engine ``streams`` (decoding / prefilling / max slots) and ``context_length``. As upstream, a request that
+-failed still counts its prompt and the tokens it emitted; the engine's own stats (seconds, rounds, drafts) come when a
+-request ends. 0150's fields (``ok``, ``mode``, ``inflight``, ``requests``, ``errors``, ...) are unchanged, and
+-``/metrics`` is unchanged.
++batch engine ``streams`` (decoding / prefilling / max slots) and ``context_length``. As upstream, a failed request
++still counts its prompt and emitted tokens; engine phase stats arrive only when its generate call returns. 0150's
++fields (``ok``, ``mode``, ``inflight``, ``requests``, ``errors``, ...) are unchanged.
++``/metrics`` retains its 13 underscore-prefixed operational families and additionally exposes the native
++``tensorfold:`` request/cache contract from a CPU-only engine snapshot.
+ 
+ A request is stalled when its last token (or its start, before the first token) is older than ``GLM53_TF_STALL_S``
+ (default 0: never) plus, before the first token, its prompt at ``GLM53_TF_STALL_PREFILL_TPS`` tokens a second
+@@ -45,6 +46,8 @@ import threading
+ import time
+ from typing import Any
+ 
++from .metrics import RequestMetrics
++
+ MODES = ("basic", "strict")
+ 
+ 
+@@ -86,7 +89,10 @@ class Health:
+             "decode_rounds", "decode_seconds", "prefill_seconds")}
+         # patches/0600: upstream's /health totals (every ended request, failed ones included)
+         self.totals: dict[str, float] = dict.fromkeys(TOTALS, 0)
+-
++        # Successful engine requests with a stats dictionary only.  This is deliberately
++        # separate from prompt_tokens_total, whose historic cohort includes failures.
++        self.prefilled_tokens_total = 0.0
++        self.request_metrics = RequestMetrics(clock=clock)
+     # -- request lifecycle -------------------------------------------------------------------------------------
+ 
+     def begin(self, prompt_tokens: int) -> int:
+@@ -137,18 +143,30 @@ class Health:
+             value = (stats or {}).get(key)
+             if isinstance(value, (int, float)) and not isinstance(value, bool):
+                 t[name] += value
++        prefill = (stats or {}).get("prefill_s")
++        if entry is not None and isinstance(prefill, (int, float)) and not isinstance(prefill, bool):
++            cached = stats.get("cached", 0)
++            if isinstance(cached, (int, float)) and not isinstance(cached, bool):
++                self.prefilled_tokens_total += max(0.0, entry["prompt"] - cached)
+ 
+     def totals_now(self) -> dict[str, Any]:
+         """patches/0600: upstream's /health totals now: ended requests plus the running replies' tokens so far."""
+ 
+         with self.lock:
+             body: dict[str, Any] = dict(self.totals)
++            body["prefilled_tokens_total"] = self.prefilled_tokens_total
+             body["completion_tokens_total"] += sum(e["tokens"] for e in self.inflight.values())
+             running = len(self.inflight)
+         body = {k: (round(v, 6) if isinstance(v, float) and not float(v).is_integer() else int(v))
+                 for k, v in body.items()}
+         return {"backend": "tensorfold", "busy": running > 0, "requests_running": running, **body}
+ 
++    def finished_totals(self) -> dict[str, float]:
++        """Counters from engine-ended requests only (unlike health's live completion total)."""
++
++        with self.lock:
++            return {**self.totals, "prefilled_tokens_total": self.prefilled_tokens_total}
++
+     def reject(self) -> str | None:
+         """Why a new completion must not start (strict mode after a fatal error), or None."""
+ 
+@@ -204,8 +222,8 @@ class Health:
+         code = 503 if self.mode == "strict" and not body["ok"] else 200
+         return code, body
+ 
+-    def metrics(self, served: str = "") -> str:
+-        """Prometheus text exposition (counters and gauges, one ``model`` label)."""
++    def metrics(self, served: str = "", app=None) -> str:
++        """Native metrics plus the unchanged underscore operational families."""
+ 
+         with self.lock:
+             now = self.clock()
+@@ -214,7 +232,7 @@ class Health:
+             stalled = len(self._stalled(now))
+             fatal = int(self.fatal is not None)
+             uptime = now - self.started
+-        label = '{model="%s"}' % served.replace("\\", "\\\\").replace('"', '\\"')
++        label = '{model="%s"}' % served.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+         rows = [
+             ("tensorfold_requests_total", "counter", "completions finished (errors included)", c["requests"]),
+             ("tensorfold_request_errors_total", "counter", "completions that raised", c["errors"]),
+@@ -238,7 +256,8 @@ class Health:
+             value = float(value)
+             shown = str(int(value)) if value.is_integer() else f"{value:.6f}"
+             out += [f"# HELP {name} {doc}", f"# TYPE {name} {kind}", f"{name}{label} {shown}"]
+-        return "\n".join(out) + "\n"
++        view = engine_view(app) if app is not None else {}
++        return self.request_metrics.render(served=served, health=self, view=view) + "\n".join(out) + "\n"
+ 
+ 
+ # patches/0600: an engine's stats key -> upstream's /health total
+@@ -248,21 +267,36 @@ TOTALS = ("requests_total", "prompt_tokens_total", "completion_tokens_total", *S
+ 
+ 
+ def engine_view(app) -> dict[str, Any]:
+-    """patches/0600: upstream's ``streams`` for a batch engine (GLM53_TF_BATCH: slots decoding / prefilling / all,
+-    read without a lock: sizes only) and ``context_length`` (the engine's limit)."""
++    """A CPU-only published engine snapshot, with the legacy test-engine fallback."""
+ 
+     out: dict[str, Any] = {}
+     engine = getattr(app, "engine", None)
+-    batch = getattr(engine, "batch", None)
+-    seqs = getattr(batch, "seqs", None)
+-    if seqs is not None:
+-        live = [s for s in list(seqs) if s is not None]
+-        out["streams"] = {"decoding": sum(1 for s in live if getattr(s, "stepper", None) is not None),
+-                          "prefilling": sum(1 for s in live if getattr(s, "stepper", None) is None),
+-                          "max": int(getattr(batch, "n", len(seqs)) or len(seqs))}
++    snapshot = getattr(engine, "telemetry_snapshot", None)
++    published_snapshot = False
++    if callable(snapshot):
++        published = snapshot()
++        if isinstance(published, dict):
++            published_snapshot = True
++            # Keep this whitelist aligned with the public health/native-metrics contract:
++            # never expose implementation tables or make HTTP readers discover fields.
++            for name in ("requests_running", "requests_waiting", "generation_tokens_running", "streams",
++                         "context_length", "pool_tokens", "pool_free_tokens", "pool_used_tokens",
++                         "pool_kept_tokens", "pool_reserved_tokens", "pool_available_tokens",
++                         "kv_pool_usage_ratio", "stream_kv_usage_ratio", "kept_prompts", "kept_bytes",
++                         "session_budget_bytes", "session_used_bytes", "cache_restores", "spill"):
++                if name in published:
++                    out[name] = published[name]
++    if not published_snapshot:
++        batch = getattr(engine, "batch", None)
++        seqs = getattr(batch, "seqs", None)
++        if seqs is not None:
++            live = [s for s in list(seqs) if s is not None]
++            out["streams"] = {"decoding": sum(1 for s in live if getattr(s, "stepper", None) is not None),
++                              "prefilling": sum(1 for s in live if getattr(s, "stepper", None) is None),
++                              "max": int(getattr(batch, "n", len(seqs)) or len(seqs))}
+     limit = getattr(engine, "limit", None)
+     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+-        out["context_length"] = limit
++        out.setdefault("context_length", limit)
+     return out
+ 
+ 
+diff --git a/src/tensorfold/cuda/metrics.py b/src/tensorfold/cuda/metrics.py
+new file mode 100644
+index 000000000..3fd3955d2
+--- /dev/null
++++ b/src/tensorfold/cuda/metrics.py
+@@ -0,0 +1,310 @@
++"""Native ``tensorfold:`` Prometheus metrics for the CUDA HTTP server.
++
++This module deliberately owns only CPU-side request accounting.  Cache and scheduler
++values arrive as an engine-published ``telemetry_snapshot`` through ``health.engine_view``;
++a scrape never walks mutable engine/cache tables.
++"""
++from __future__ import annotations
++
++import threading
++import time
++from dataclasses import dataclass, field
++from typing import Any
++
++PREFIX = "tensorfold:"
++# Long prompts and long-running tool calls are routine on this server.  Keep the
++# conventional early edges, but do not put everything past five minutes in +Inf.
++BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
++           600.0, 1200.0, 3600.0)
++TPOT_BUCKETS = (0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05,
++                0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0, 10.0)
++
++
++def _number(value: Any) -> float | None:
++    if isinstance(value, (int, float)) and not isinstance(value, bool):
++        value = float(value)
++        if value >= 0 and value != float("inf") and value == value:
++            return value
++    return None
++
++
++def _shown(value: float | int) -> str:
++    value = float(value)
++    return str(int(value)) if value.is_integer() else f"{value:.6f}".rstrip("0").rstrip(".")
++
++
++def _escape(value: Any) -> str:
++    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
++
++
++@dataclass
++class Histogram:
++    """A small fixed-bucket histogram.  The owner supplies synchronization."""
++
++    edges: tuple[float, ...]
++    counts: list[int] = field(init=False)
++    total: float = 0.0
++    samples: int = 0
++
++    def __post_init__(self) -> None:
++        self.counts = [0] * (len(self.edges) + 1)
++
++    def observe(self, raw: float) -> None:
++        value = max(0.0, float(raw))
++        self.samples += 1
++        self.total += value
++        for index, edge in enumerate(self.edges):
++            if value <= edge:
++                self.counts[index] += 1
++                return
++        self.counts[-1] += 1
++
++    def copy(self) -> tuple[tuple[int, ...], float, int]:
++        return tuple(self.counts), self.total, self.samples
++
++
++class RequestTicket:
++    """One inference HTTP request, finalized exactly once by its handler.
++
++    The ticket starts immediately before request validation.  Generated-token timing is
++    recorded by ``App.run``'s engine callback, not by the stream's role prelude.
++    """
++
++    def __init__(self, owner: "RequestMetrics", started: float) -> None:
++        self._owner = owner
++        self.started = started
++        self.prompt_tokens: int | None = None
++        self.generated = 0
++        self.first_token: float | None = None
++        self.last_token: float | None = None
++        self.stats: dict[str, Any] | None = None
++        self.finished = False
++
++    def prompt(self, tokens: int) -> None:
++        self.prompt_tokens = max(0, int(tokens))
++
++    def tokens(self, count: int) -> None:
++        count = max(0, int(count))
++        if not count:
++            return
++        now = self._owner.clock()
++        if self.first_token is None:
++            self.first_token = now
++        self.last_token = now
++        self.generated += count
++
++    def engine_stats(self, stats: Any) -> None:
++        if isinstance(stats, dict):
++            self.stats = stats
++
++    def finish(self, status: int, outcome: str, *, disconnected: bool = False) -> None:
++        if self.finished:
++            return
++        self.finished = True
++        self._owner._finish(self, status, outcome, disconnected)
++        self._owner._clear(self)
++
++
++class RequestMetrics:
++    """Bounded native HTTP counters and request timing distributions."""
++
++    def __init__(self, *, clock=time.monotonic) -> None:
++        self.clock = clock
++        self.lock = threading.Lock()
++        self._local = threading.local()
++        self.requests: dict[tuple[str, str], int] = {}
++        self.disconnects = 0
++        self.latency = Histogram(BUCKETS)
++        self.ttft = Histogram(BUCKETS)
++        self.prefill = Histogram(BUCKETS)
++        self.decode = Histogram(BUCKETS)
++        self.tpot = Histogram(TPOT_BUCKETS)
++
++    def begin(self) -> RequestTicket:
++        return RequestTicket(self, self.clock())
++
++    def activate(self, ticket: RequestTicket) -> None:
++        """Make a handler ticket visible through family ``run`` overrides on this thread."""
++
++        self._local.ticket = ticket
++
++    def current(self) -> RequestTicket | None:
++        ticket = getattr(self._local, "ticket", None)
++        return ticket if isinstance(ticket, RequestTicket) and not ticket.finished else None
++
++    def _clear(self, ticket: RequestTicket) -> None:
++        if getattr(self._local, "ticket", None) is ticket:
++            del self._local.ticket
++
++    def _finish(self, ticket: RequestTicket, status: int, outcome: str, disconnected: bool) -> None:
++        now = self.clock()
++        # The handler uses only this fixed vocabulary.  Preserve bounded cardinality if
++        # a caller outside it passes an implementation-specific result.
++        outcome = outcome if outcome in {"success", "refused", "error", "cancelled"} else "error"
++        key = (str(int(status)), outcome)
++        with self.lock:
++            self.requests[key] = self.requests.get(key, 0) + 1
++            if disconnected:
++                self.disconnects += 1
++            self.latency.observe(now - ticket.started)
++            if ticket.first_token is not None:
++                self.ttft.observe(ticket.first_token - ticket.started)
++            stats = ticket.stats
++            if stats is not None:
++                prefill = _number(stats.get("prefill_s"))
++                decode = _number(stats.get("decode_s"))
++                if prefill is not None and prefill > 0:
++                    self.prefill.observe(prefill)
++                if decode is not None and decode > 0:
++                    self.decode.observe(decode)
++            if ticket.generated >= 2 and ticket.first_token is not None and ticket.last_token is not None:
++                self.tpot.observe((ticket.last_token - ticket.first_token) / (ticket.generated - 1))
++
++    def render(self, *, served: str, health: Any, view: dict[str, Any] | None = None) -> str:
++        """Render native families from fixed counters plus the published engine view."""
++
++        with self.lock:
++            requests = tuple(sorted(self.requests.items()))
++            disconnects = self.disconnects
++            histograms = (("request_latency_seconds", "Seconds from HTTP arrival to terminal handling.", self.latency.copy()),
++                          ("time_to_first_token_seconds", "Seconds from HTTP arrival to the first generated token.", self.ttft.copy()),
++                          ("request_prefill_seconds", "Engine prefill seconds reported by completed requests.", self.prefill.copy()),
++                          ("request_decode_seconds", "Engine decode seconds reported by completed requests.", self.decode.copy()),
++                          ("request_time_per_output_token_seconds", "Seconds between generated tokens divided by generated tokens less one.", self.tpot.copy()))
++        view = view or {}
++        lines: list[str] = []
++        _family(lines, "requests_total", "counter", "Terminal inference HTTP requests by HTTP status and engine outcome.")
++        for (status, outcome), count in requests:
++            lines.append(f'{PREFIX}requests_total{{status="{_escape(status)}",outcome="{_escape(outcome)}"}} {count}')
++        _scalar(lines, "client_disconnections_total", "counter", "Clients that departed before terminal output.", disconnects)
++
++        totals = getattr(health, "finished_totals", health.totals_now)()
++        for name, doc in (("prompt_tokens_total", "Prompt tokens of engine-ended requests, including failed requests that reached the engine."),
++                          ("completion_tokens_total", "Generated tokens of engine-ended requests, including tokens emitted before failure."),
++                          ("rounds_total", "Per-request decode rounds reported by completed engine requests."),
++                          ("drafted_total", "Draft tokens proposed by completed engine requests."),
++                          ("accepted_total", "Draft tokens accepted by completed engine requests.")):
++            value = _number(totals.get(name))
++            if value is not None:
++                native = {"completion_tokens_total": "generation_tokens_total", "rounds_total": "decode_rounds_total",
++                          "drafted_total": "mtp_drafted_total", "accepted_total": "mtp_accepted_total"}.get(name, name)
++                _scalar(lines, native, "counter", doc, value)
++        prefilled = _number(totals.get("prefilled_tokens_total"))
++        if prefilled is not None:
++            _scalar(lines, "prefilled_tokens_total", "counter",
++                    "Uncached prompt tokens of successful requests with engine statistics.", prefilled)
++
++        for name, doc in (("requests_running", "Requests admitted to prefill or decode."),
++                          ("requests_waiting", "Requests queued awaiting admission."),
++                          ("generation_tokens_running", "Generated tokens held by live streams.")):
++            value = _number(view.get(name))
++            if value is not None:
++                _scalar(lines, name, "gauge", doc, value)
++        streams = view.get("streams")
++        if isinstance(streams, dict):
++            rows = [(str(state), _number(value)) for state, value in sorted(streams.items())
++                    if state in {"decoding", "prefilling", "filling", "paused", "max"}]
++            rows = [(state, value) for state, value in rows if value is not None]
++            if rows:
++                _family(lines, "streams", "gauge", "Streams by published scheduler state.")
++                lines.extend(f'{PREFIX}streams{{state="{_escape(state)}"}} {_shown(value)}' for state, value in rows)
++
++        _cache(lines, view)
++        for name, doc, snapshot in histograms:
++            _histogram(lines, name, doc, snapshot, TPOT_BUCKETS if name.endswith("output_token_seconds") else BUCKETS)
++        return "\n".join(lines) + "\n"
++
++
++def _family(lines: list[str], name: str, kind: str, doc: str) -> None:
++    lines.extend((f"# HELP {PREFIX}{name} {doc}", f"# TYPE {PREFIX}{name} {kind}"))
++
++
++def _scalar(lines: list[str], name: str, kind: str, doc: str, value: float | int) -> None:
++    _family(lines, name, kind, doc)
++    lines.append(f"{PREFIX}{name} {_shown(value)}")
++
++
++def _histogram(lines: list[str], name: str, doc: str, snapshot: tuple[tuple[int, ...], float, int],
++               edges: tuple[float, ...]) -> None:
++    counts, total, samples = snapshot
++    _family(lines, name, "histogram", doc)
++    cumulative = 0
++    for edge, count in zip(edges, counts):
++        cumulative += count
++        lines.append(f'{PREFIX}{name}_bucket{{le="{_shown(edge)}"}} {cumulative}')
++    cumulative += counts[-1]
++    lines.extend((f'{PREFIX}{name}_bucket{{le="+Inf"}} {cumulative}',
++                  f"{PREFIX}{name}_sum {_shown(total)}", f"{PREFIX}{name}_count {samples}"))
++
++
++def _cache(lines: list[str], view: dict[str, Any]) -> None:
++    scalar_fields = (
++        ("context_length", "Context limit of this engine."),
++        ("pool_tokens", "Positions in the shared KV pool."),
++        ("pool_free_tokens", "Physically unallocated positions in the shared KV pool."),
++        ("pool_used_tokens", "Mapped positions held by streams and retained prompts."),
++        ("pool_kept_tokens", "Pool positions held for retained prompts."),
++        ("pool_reserved_tokens", "Admission reservations not yet mapped into pool pages."),
++        ("pool_available_tokens", "Positions available to new admissions after reservations."),
++        ("kept_prompts", "Retained in-memory prompt states."),
++        ("kept_bytes", "Retained snapshot bytes outside the shared pool."),
++        ("session_budget_bytes", "Configured RAM-session budget in bytes."),
++        ("session_used_bytes", "RAM-session bytes currently charged."),
++    )
++    for name, doc in scalar_fields:
++        value = _number(view.get(name))
++        if value is not None:
++            _scalar(lines, name, "gauge", doc, value)
++    for name, doc in (("kv_pool_usage_ratio", "Mapped shared-pool positions divided by pool capacity."),):
++        value = _number(view.get(name))
++        if value is not None:
++            _scalar(lines, name, "gauge", doc, value)
++    stream_ratio = _number(view.get("stream_kv_usage_ratio"))
++    if stream_ratio is not None:
++        _family(lines, "kv_cache_usage_ratio", "gauge", "Completed live-stream context divided by the context limit.")
++        lines.append(f'{PREFIX}kv_cache_usage_ratio{{pool="0"}} {_shown(stream_ratio)}')
++    restores = view.get("cache_restores")
++    if isinstance(restores, dict):
++        sources = ("none", "slot", "ram", "disk")
++        for kind, doc in (("requests", "Requests restored from each cache source."),
++                          ("tokens", "Tokens restored from each cache source.")):
++            rows = [(source, _number(values.get(kind))) for source, values in restores.items()
++                    if source in sources and isinstance(values, dict)]
++            rows = [(str(source), value) for source, value in rows if value is not None]
++            if rows:
++                _family(lines, f"cache_restore_{kind}_total", "counter", doc)
++                lines.extend(f'{PREFIX}cache_restore_{kind}_total{{source="{_escape(source)}"}} {_shown(value)}'
++                             for source, value in sorted(rows))
++    spill = view.get("spill")
++    if not isinstance(spill, dict):
++        return
++    gauges = (("gib", "spill_gib", "Spill tier capacity in GiB."), ("entries", "spill_entries", "Committed spill entries."),
++              ("stored_bytes", "spill_stored_bytes", "Physical bytes stored by committed spill entries."),
++              ("budget_used_bytes", "spill_budget_used_bytes", "Spill budget bytes charged to indexed entries, including pending writes."),
++              ("pending", "spill_pending", "Pending asynchronous spill writes."),
++              ("pending_bytes", "spill_pending_bytes", "Bytes in pending asynchronous spill writes."),
++              ("disk_free_bytes", "spill_disk_free_bytes", "Rank-zero local free bytes on the spill filesystem."),
++              ("restore_ms_p50", "spill_restore_seconds_p50", "Spill restore p50 seconds."),
++              ("restore_ms_p95", "spill_restore_seconds_p95", "Spill restore p95 seconds."))
++    for field, name, doc in gauges:
++        value = _number(spill.get(field))
++        if value is not None:
++            if field.startswith("restore_ms_"):
++                value /= 1000
++            _scalar(lines, name, "gauge", doc, value)
++    counters = (("written", "spill_written_total", "Completed spill writes."),
++                ("written_bytes", "spill_written_bytes_total", "Bytes written by completed spill writes."),
++                ("loaded", "spill_loaded_total", "Completed local spill loads."),
++                ("loaded_bytes", "spill_loaded_bytes_total", "Bytes read by completed local spill loads."),
++                ("loaded_tokens", "spill_loaded_tokens_total", "Tokens restored after distributed restore success."),
++                ("write_failed", "spill_write_failed_total", "Failed spill writes."),
++                ("checksum_failed", "spill_checksum_failed_total", "Spill SHA-256 checksum failures."),
++                ("load_failed", "spill_load_failed_total", "Other failed spill loads."),
++                ("restore_failed", "spill_restore_failed_total", "Distributed spill restores that failed on either rank."))
++    for field, name, doc in counters:
++        value = _number(spill.get(field))
++        if value is not None:
++            _scalar(lines, name, "counter", doc, value)
++
++
++__all__ = ["BUCKETS", "TPOT_BUCKETS", "Histogram", "RequestMetrics", "RequestTicket"]
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index 89720369e..e72f1d723 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -609,8 +609,8 @@ def log_error(exc: BaseException, what: str) -> None:
+     print(redact(f"[tensorfold] {what}: {type(exc).__name__}: {exc}\n{lines}"), end="", flush=True)
+ 
+ 
+-def _takes_cancelled(run: Callable) -> bool:
+-    """patches/0600: whether an app's ``run`` takes ``cancelled=``."""
++def _takes_keyword(run: Callable, name: str) -> bool:
++    """Whether an application's ``run`` accepts the optional handler keyword."""
+ 
+     import inspect
+ 
+@@ -618,7 +618,11 @@ def _takes_cancelled(run: Callable) -> bool:
+         params = inspect.signature(run).parameters
+     except (TypeError, ValueError):
+         return False
+-    return "cancelled" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
++    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
++
++
++def _takes_cancelled(run: Callable) -> bool:
++    return _takes_keyword(run, "cancelled")
+ 
+ 
+ def disconnect_on() -> bool:
+@@ -804,12 +808,14 @@ class App:
+         return content, calls, reasoning
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
+-            cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
++            cancelled: Callable[[], bool] | None = None, ticket=None) -> dict[str, Any]:
+         """One reply. patches/0600 (upstream 24afe5e): ``cancelled()`` is true once the client has gone. A request that
+         has not started raises ``RequestCancelled`` without an engine call; a running one stops at its next round (the
+         batch engine also polls it while the request waits and prefills) and raises ``RequestCancelled`` once
+         ``generate`` returns, so no truncated reply is written. The per-token callback never raises into the engine:
+         a failure stops the request and is raised after ``generate`` returns."""
++        if ticket is None:
++            ticket = self.health.request_metrics.current()
+ 
+         tools = body.get("tools") or []
+         kwargs = dict(body.get("chat_template_kwargs") or {})
+@@ -828,6 +834,8 @@ class App:
+             prompt = self.given_ids(text)
+         else:
+             prompt = self.prompt_ids(text)         # patches/0210
++        if ticket is not None:
++            ticket.prompt(len(prompt))
+         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens)
+         sampling = self.sampling_for(body, prompt)
+         out: list[int] = []
+@@ -868,6 +876,8 @@ class App:
+             return len(out)
+ 
+         def on_tokens(new: list[int]) -> bool:
++            if ticket is not None:
++                ticket.tokens(len(new))
+             # patches/0600: True stops the request after this round; once stopped (client gone, a stop string, a
+             # failure) every later call returns True at once and nothing more is decoded into text or sent
+             if stopped["client"] or failed:
+@@ -913,6 +923,8 @@ class App:
+                 raise RequestCancelled("the client left before the request started")
+             stats = self.engine.generate(prompt, max_tokens, sampling, on_tokens,
+                                          **({} if draft else {"draft": False}))
++        if ticket is not None:
++            ticket.engine_stats(stats)
+         if failed:                                  # patches/0600: the callback's failure (a 500 / stream error)
+             raise failed[0]
+         if stopped["client"]:                       # patches/0600: as upstream, nothing more is written
+@@ -968,7 +980,7 @@ def make_handler(app: App):
+         def log_message(self, fmt, *args):  # quiet
+             pass
+ 
+-        def _json(self, code: int, payload: dict[str, Any]) -> None:
++        def _json(self, code: int, payload: dict[str, Any]) -> bool:
+             data = json.dumps(payload).encode()
+             try:
+                 self.send_response(code)
+@@ -976,8 +988,10 @@ def make_handler(app: App):
+                 self.send_header("Content-Length", str(len(data)))
+                 self.end_headers()
+                 self.wfile.write(data)
+-            except (BrokenPipeError, ConnectionResetError):          # patches/0600: the client has gone
++                return True
++            except OSError:          # patches/0600: the client has gone
+                 self.close_connection = True
++                return False
+ 
+         def _refuse(self, exc: BaseException) -> None:
+             """patches/0600 (upstream 2bc35c4): a request ``check`` / ``tokenize`` could not read is a 400, never a
+@@ -1001,12 +1015,15 @@ def make_handler(app: App):
+             elif self.path.rstrip("/") in ("/health", "/v1/health"):
+                 self._json(*app.health.status(app))         # patches/0150; 0600: upstream's live totals too
+             elif self.path.rstrip("/") == "/metrics":       # patches/0150: Prometheus text
+-                data = app.health.metrics(app.served).encode()
+-                self.send_response(200)
+-                self.send_header("Content-Type", "text/plain; version=0.0.4")
+-                self.send_header("Content-Length", str(len(data)))
+-                self.end_headers()
+-                self.wfile.write(data)
++                data = app.health.metrics(app.served, app).encode()
++                try:
++                    self.send_response(200)
++                    self.send_header("Content-Type", "text/plain; version=0.0.4")
++                    self.send_header("Content-Length", str(len(data)))
++                    self.end_headers()
++                    self.wfile.write(data)
++                except OSError:
++                    self.close_connection = True
+             else:
+                 self._json(404, {"error": "not found"})
+ 
+@@ -1016,11 +1033,18 @@ def make_handler(app: App):
+             tokenize = path in ("/tokenize", "/v1/tokenize")        # patches/0490
+             if not chat and not tokenize and not path.endswith("/completions"):
+                 return self._json(404, {"error": "not found"})
++            ticket = None if tokenize else app.health.request_metrics.begin()
++            if ticket is not None:
++                app.health.request_metrics.activate(ticket)
+             try:
+                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+             except (json.JSONDecodeError, UnicodeDecodeError, ValueError):   # patches/0600: non-UTF-8, bad length
++                if ticket is not None:
++                    ticket.finish(400, "refused")
+                 return self._json(400, error_body("the request body is not JSON"))
+             if not isinstance(body, dict):
++                if ticket is not None:
++                    ticket.finish(400, "refused")
+                 return self._json(400, error_body("the request body must be a JSON object"))
+             if tokenize:                        # patches/0490: host only (no engine, no lock, nothing to rank 1)
+                 try:
+@@ -1032,13 +1056,16 @@ def make_handler(app: App):
+             try:
+                 problem = app.check(body)
+             except Exception as exc:                    # patches/0600: a 400, not a dropped connection
++                ticket.finish(400, "refused")
+                 return self._refuse(exc)
+             if problem:                                 # patches/0490: with a Problem's code / param
+                 status = getattr(problem, "status", 400)        # patches/0600: 503 = retry shortly
++                ticket.finish(status, "refused")
+                 return self._json(status, error_body(problem, "invalid_request_error" if status == 400
+                                                       else "server_error"))
+             refused = app.health.reject()           # patches/0150: GLM53_TF_HEALTH=strict after a fatal error
+             if refused:
++                ticket.finish(503, "refused")
+                 return self._json(503, {"error": {"message": refused, "type": "server_error"}})
+             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}" if chat else f"cmpl-{uuid.uuid4().hex[:24]}"
+             created = int(time.time())
+@@ -1048,10 +1075,9 @@ def make_handler(app: App):
+             # decodes (GLM53_TF_DISCONNECT=0: off)
+             gone = socket_cancellation(self.connection) if getattr(app, "disconnect", True) else None
+             cancelled = (lambda: gone.cancelled) if gone is not None else None     # noqa: E731
+-            if not _takes_cancelled(app.run):                   # an app whose ``run`` predates 0600
+-                cancelled = None
+-            extra = {} if cancelled is None else {"cancelled": cancelled}
+-
++            extra = {} if cancelled is None or not _takes_cancelled(app.run) else {"cancelled": cancelled}
++            if _takes_keyword(app.run, "ticket"):
++                extra["ticket"] = ticket
+             def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
+                 if chat:
+                     return {"id": rid, "object": kind, "created": created, "model": app.served,
+@@ -1060,11 +1086,16 @@ def make_handler(app: App):
+                         "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
+ 
+             if stream:
+-                self.send_response(200)
+-                self.send_header("Content-Type", "text/event-stream")
+-                self.send_header("Cache-Control", "no-cache")
+-                self.send_header("Connection", "close")
+-                self.end_headers()
++                try:
++                    self.send_response(200)
++                    self.send_header("Content-Type", "text/event-stream")
++                    self.send_header("Cache-Control", "no-cache")
++                    self.send_header("Connection", "close")
++                    self.end_headers()
++                except OSError:
++                    ticket.finish(499, "cancelled", disconnected=True)
++                    self.close_connection = True
++                    return
+ 
+                 def emit(delta: dict[str, Any]) -> bool:
+                     try:
+@@ -1079,9 +1110,11 @@ def make_handler(app: App):
+                 try:
+                     result = app.run(body, chat, emit, **extra)
+                 except RequestCancelled:        # patches/0600: the client has gone; nothing more is written
++                    ticket.finish(200, "cancelled", disconnected=True)
+                     self.close_connection = True
+                     return
+                 except Exception as exc:        # patches/0150: an error event, not a dropped connection
++                    ticket.finish(200, "refused" if isinstance(exc, ValueError) else "error")
+                     if not isinstance(exc, ValueError):
+                         log_error(exc, "request failed (stream error event)")      # patches/0600
+                     try:
+@@ -1109,21 +1142,26 @@ def make_handler(app: App):
+                 if (body.get("stream_options") or {}).get("include_usage"):
+                     end["usage"] = usage
+                 end["tensorfold"] = result["stats"]      # patches/0090: the engine's stats (effective tf_knobs)
++                departed = False
+                 try:
+                     self.wfile.write(f"data: {json.dumps(end)}\n\ndata: [DONE]\n\n".encode())
+                     self.wfile.flush()
+                 except OSError:
+-                    pass
++                    departed = True
++                ticket.finish(200, "cancelled" if departed else "success", disconnected=departed)
+                 self.close_connection = True
+                 return
+             try:
+                 result = app.run(body, chat, lambda delta: True, **extra)
+             except RequestCancelled:            # patches/0600: the client has gone; no reply
++                ticket.finish(499, "cancelled", disconnected=True)
+                 self.close_connection = True
+                 return
+             except ValueError as exc:           # patches/0150: a request the engine refused
++                ticket.finish(400, "refused")
+                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+             except Exception as exc:            # patches/0150: a JSON 500, not a dropped connection
++                ticket.finish(500, "error")
+                 log_error(exc, "request failed (500)")                  # patches/0600
+                 return self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}"[:500],
+                                                   "type": "server_error"}})
+@@ -1143,8 +1181,8 @@ def make_handler(app: App):
+                 payload = {"id": rid, "object": "text_completion", "created": created, "model": app.served,
+                            "choices": [{"index": 0, "text": result["content"], "finish_reason": result["finish"]}],
+                            "usage": usage, "tensorfold": result["stats"]}
+-            self._json(200, payload)
+-
++            delivered = self._json(200, payload)
++            ticket.finish(200 if delivered else 499, "success" if delivered else "cancelled", disconnected=not delivered)
+     return Handler
+ 
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index 2dc5384ad..1da2a5fac 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -1500,6 +1500,24 @@ class Batcher:
+         finally:
+             st.proj, st.scratch_set, st.scratch = saved
+ 
++    def _publish(self) -> None:
++        """Publish the scheduler-owned CPU view; HTTP readers never inspect this batcher."""
++        metrics = getattr(self.g, "cache_metrics", None)
++        if metrics is not None:
++            metrics.publish_batch(self)
++
++    def _publish_waiting(self) -> None:
++        """Publish only queue length while holding ``cv`` on an HTTP thread."""
++        metrics = getattr(self.g, "cache_metrics", None)
++        if metrics is not None:
++            metrics.publish_waiting(len(self.queue))
++
++
++    def _restore_metric(self, source: str, tokens: int) -> None:
++        record = getattr(self.g, "_telemetry_restore", None)
++        if record is not None:
++            record(source, tokens)
++
+     # -- rank 0: requests in ---------------------------------------------------------------------------------------
+     def _job(self, prompt, max_tokens, sampling, draft: bool, spec: str | None, stop_eos: bool, knobs=None,
+              background: bool = False) -> Job:
+@@ -1544,14 +1562,19 @@ class Batcher:
+             raise RuntimeError("the batch loop stopped") from self.error
+         with self.cv:
+             self.queue.extend(jobs)
++            self._publish_waiting()
+             self.cv.notify()
+ 
+     def _cancel(self, job: Job) -> None:
+-        """Rank 0, an HTTP thread: end ``job`` at the next plan (a queued job is dropped, an admitted one, prefilling
+-        or decoding, is cancelled through the plan rank 1 receives: the same path as every cancel)."""
+-
+-        job.cancel = True
++        """Rank 0, an HTTP thread: drop queued work immediately; active work ends in the next shared plan."""
+         with self.cv:
++            job.cancel = True
++            if job in self.queue:
++                self.queue.remove(job)
++                job.stats.update(cancelled=True)
++                if job.out is not None:
++                    job.out.put(None)
++            self._publish_waiting()
+             self.cv.notify()
+ 
+     def _collect(self, job: Job, on_tokens: Callable | None) -> list[int]:
+@@ -1715,7 +1738,10 @@ class Batcher:
+             self._flush()                       # patches/0370: tokens decided before the failure first
+             with self.cv:
+                 jobs = [s.job for s in self.seqs if s is not None] + list(self.queue)
++                self.seqs = [None] * self.n
+                 self.queue.clear()
++                self._publish_waiting()
++            self._publish()
+             for job in jobs:
+                 if job.out is not None:
+                     job.out.put(exc)
+@@ -2018,6 +2044,7 @@ class Batcher:
+             self._spill(s)
+         for slot, cached, job in admits:
+             self._admit(slot, cached, job)
++        self._publish()
+         waiting = [q for q in self.seqs if q is not None and q.stepper is not None] if pieces else []
+         for grp in mpf.groups(self, pieces) if self.mpf_rows else [[s] for s in pieces]:     # patches/0560
+             t0 = time.perf_counter()
+@@ -2035,6 +2062,7 @@ class Batcher:
+             self._verify(active)
+         if self.pool_check and not self.kvp.null_clean():     # patches/0290, GLM53_TF_KV_POOL_CHECK=1
+             raise RuntimeError(f"KV pool: the null page was written in round {self.round} (an unmapped row)")
++        self._publish()
+ 
+     def _admit(self, slot: int, cached: int, job: Job) -> None:
+         if self.seqs[slot] is not None:
+@@ -2045,6 +2073,7 @@ class Batcher:
+             sp.truncate(cached)
+             job.stats["kv_pages"] = sp.quota
+         hit = None
++        source = "slot" if cached else "none"
+         sess = job.sess if self.store is not None else None
+         entry = sess.entry if sess is not None else None
+         if entry is not None:                   # patches/0180: a stored session, copied into this slot's caches
+@@ -2055,6 +2084,7 @@ class Batcher:
+             with self.store.on(slot):
+                 hit = self.store.restore(entry, self.drafters[slot] if use_dflash else None)
+             self.caches[slot] = []              # the slot's own snapshots no longer match its caches
++            source = "ram"
+         elif sess is not None and sess.disk is not None:        # patches/0250: read from disk into this slot
+             if len(sess.disk.ids) != cached or job.prompt[:cached] != sess.disk.ids:
+                 raise RuntimeError(f"session disk entry {sess.disk.id} does not hold the {cached} tokens slot {slot} "
+@@ -2066,12 +2096,15 @@ class Batcher:
+             job.stats["disk"] = dict(self.store.disk.last)
+             if hit is None:                     # a rank failed to read it: both prefill from scratch
+                 cached = 0
++                source = "none"
+             else:
++                source = "disk"
+                 job.stats["restored_disk"] = sess.disk.id
+         elif cached:
+             hit = next((c for c in self.caches[slot] if len(c.ids) == cached and job.prompt[:cached] == c.ids), None)
+             if hit is None:
+                 raise RuntimeError(f"no snapshot of {cached} tokens on slot {slot} to resume from")
++        self._restore_metric(source, cached)
+         # the request writes the slot's attention caches from its resume point on: longer snapshots go
+         self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= cached]
+         if self.store is not None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/cachemetrics.py b/src/tensorfold/families/glm5_next/cuda/cachemetrics.py
+new file mode 100644
+index 000000000..ff880c2f8
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/cachemetrics.py
+@@ -0,0 +1,196 @@
++"""CPU-published cache and scheduler telemetry for the GLM CUDA engine.
++
++The HTTP side only reads :meth:`CacheMetrics.snapshot`.  Mutable scheduler, pool,
++and session-store state is sampled by its owning engine thread at lifecycle
++boundaries, so a scrape never needs CUDA, a collective, or a cache walk.
++"""
++from __future__ import annotations
++
++import threading
++from contextlib import nullcontext
++from typing import Any
++
++
++_RESTORE_SOURCES = ("none", "slot", "ram", "disk")
++
++
++class CacheMetrics:
++    """A small immutable-at-publication view of GLM cache state.
++
++    ``publish_batch`` and ``publish_lone`` run only at engine/scheduler
++    boundaries.  They inspect scalar bookkeeping, never token lists or device
++    state.  ``snapshot`` returns fresh dictionaries so callers cannot mutate
++    the published view seen by another HTTP request.
++    """
++
++    def __init__(self, engine) -> None:
++        self.engine = engine
++        # Attached before CacheMetrics is made; HTTP reads can use only the
++        # DiskTier's own lock-protected, no-I/O published view.
++        self._store = getattr(engine, "store", None)
++        self._lock = threading.Lock()
++        self._restores = {name: {"requests": 0, "tokens": 0} for name in _RESTORE_SOURCES}
++        self._snapshot: dict[str, Any] = {}
++        self._lone = {"phase": None, "prefill_done": 0, "generation": 0}
++        self.publish_lone()
++
++    def record_restore(self, source: str, tokens: int) -> None:
++        """Record the outcome actually used by a request, not a lookup attempt."""
++        if source not in self._restores:
++            raise ValueError(f"unknown cache restore source {source!r}")
++        with self._lock:
++            item = self._restores[source]
++            item["requests"] += 1
++            item["tokens"] += max(0, int(tokens))
++
++    def set_lone(self, phase: str | None, *, prefill_done: int | None = None,
++                 generation: int | None = None) -> None:
++        """Publish lone-engine progress without reading its mutable caches on a scrape."""
++        with self._lock:
++            self._lone["phase"] = phase
++            if prefill_done is not None:
++                self._lone["prefill_done"] = max(0, int(prefill_done))
++            if generation is not None:
++                self._lone["generation"] = max(0, int(generation))
++        self.publish_lone()
++    def publish_waiting(self, waiting: int) -> None:
++        """Update only the queue gauge from the HTTP-side queue lock."""
++        with self._lock:
++            out = dict(self._snapshot)
++            out["requests_waiting"] = max(0, int(waiting))
++            self._snapshot = out
++
++
++    @staticmethod
++    def _pool_view(pool) -> dict[str, Any]:
++        if pool is None:
++            return {}
++        alloc = getattr(pool, "alloc", None)
++        page = getattr(pool, "page", None)
++        npages = getattr(pool, "npages", None)
++        if alloc is None or page is None or npages is None or not hasattr(alloc, "n_free"):
++            return {}
++        page, npages, free_pages = int(page), int(npages), int(alloc.n_free)
++        used_pages = npages - free_pages
++        reserved_pages = int(pool.outstanding()) if hasattr(pool, "outstanding") else 0
++        available_pages = int(pool.available()) if hasattr(pool, "available") else free_pages - reserved_pages
++        out = {
++            "pool_tokens": npages * page,
++            "pool_free_tokens": free_pages * page,
++            "pool_used_tokens": used_pages * page,
++            "pool_reserved_tokens": reserved_pages * page,
++            "pool_available_tokens": available_pages * page,
++        }
++        out["kv_pool_usage_ratio"] = used_pages / npages if npages else 0.0
++        return out
++
++    @staticmethod
++    def _store_view(store) -> dict[str, Any]:
++        if store is None:
++            return {}
++        index = getattr(store, "index", None)
++        if index is None:
++            return {}
++        entries = getattr(index, "entries", None)
++        if entries is None or not hasattr(index, "used") or not hasattr(index, "budget"):
++            return {}
++        return {
++            "kept_prompts": len(entries),
++            "kept_bytes": int(index.used),
++            "session_budget_bytes": int(index.budget),
++            "session_used_bytes": int(index.used),
++        }
++
++    @staticmethod
++    def _disk_view(store) -> dict[str, Any] | None:
++        disk = getattr(store, "disk", None) if store is not None else None
++        method = getattr(disk, "telemetry_snapshot", None)
++        if not callable(method):
++            return None
++        value = method()
++        return dict(value) if isinstance(value, dict) else None
++
++    def _base(self) -> dict[str, Any]:
++        engine = self.engine
++        limit = getattr(engine, "limit", None)
++        out: dict[str, Any] = {"cache_restores": {name: dict(value) for name, value in self._restores.items()}}
++        if limit is not None:
++            out["context_length"] = int(limit)
++        out.update(self._store_view(self._store))
++        spill = self._disk_view(self._store)
++        if spill is not None:
++            out["spill"] = spill
++        return out
++
++    def publish_lone(self) -> None:
++        """Sample a lone engine at a lifecycle boundary (never from HTTP)."""
++        with self._lock:
++            phase = self._lone["phase"]
++            running = int(phase is not None)
++            streams = {"decoding": int(phase == "decoding"), "prefilling": int(phase == "prefilling"),
++                       "filling": 0, "paused": 0, "max": 1}
++            out = self._base()
++            out.update(requests_running=running, requests_waiting=0,
++                       generation_tokens_running=self._lone["generation"], streams=streams)
++            limit = out.get("context_length", 0)
++            if limit:
++                completed = self._lone["prefill_done"] if phase is not None else 0
++                out["stream_kv_usage_ratio"] = min(completed / limit, 1.0)
++            pages = getattr(getattr(getattr(self.engine, "e", None), "st", None), "pages", None)
++            pool = getattr(pages, "pool", None)
++            out.update(self._pool_view(pool))
++            if pool is not None and phase is None:
++                out["pool_kept_tokens"] = int(getattr(pages, "held", 0)) * int(getattr(pool, "page", 0))
++            self._snapshot = out
++
++    def publish_batch(self, batch) -> None:
++        """Sample scalar batch state after a scheduler ownership transition."""
++        cv = getattr(batch, "cv", None)
++        guard = cv if hasattr(cv, "__enter__") else nullcontext()
++        # Keep cv -> cache lock ordering: HTTP submit/cancel makes its queue
++        # update under cv before it publishes the scalar waiting gauge.
++        with guard:
++            seqs = tuple(getattr(batch, "seqs", ()))
++            states = tuple(getattr(batch, "states", ()))
++            queued = len(getattr(batch, "queue", ()))
++            prefilling = sum(seq is not None and getattr(seq, "stepper", None) is None for seq in seqs)
++            decoding = sum(seq is not None and getattr(seq, "stepper", None) is not None for seq in seqs)
++            generated = sum(max(int(getattr(seq, "emitted", 0)),
++                                len(getattr(getattr(seq, "stepper", None), "out", ())))
++                            for seq in seqs if seq is not None)
++            completed = [int(getattr(seq, "done", 0)) if getattr(seq, "stepper", None) is None
++                         else int(getattr(states[slot], "pos", 0)) if slot < len(states) else 0
++                         for slot, seq in enumerate(seqs) if seq is not None]
++            pool = getattr(batch, "kvp", None)
++            idle_pages = sum(int(getattr(getattr(state, "pages", None), "held", 0))
++                             for slot, state in enumerate(states)
++                             if slot >= len(seqs) or seqs[slot] is None)
++            with self._lock:
++                out = self._base()
++                out.update(requests_running=prefilling + decoding, requests_waiting=queued,
++                           generation_tokens_running=generated,
++                           streams={"decoding": decoding, "prefilling": prefilling, "filling": 0, "paused": 0,
++                                    "max": int(getattr(batch, "n", len(seqs)))})
++                out.update(self._pool_view(pool))
++                if pool is not None:
++                    out["pool_kept_tokens"] = idle_pages * int(getattr(pool, "page", 0))
++                limit = out.get("context_length", 0)
++                if limit:
++                    out["stream_kv_usage_ratio"] = min(max(completed, default=0) / limit, 1.0)
++                self._snapshot = out
++
++    def snapshot(self) -> dict[str, Any]:
++        """Return a detached CPU-only copy for health/metrics readers."""
++        with self._lock:
++            out = dict(self._snapshot)
++            out["streams"] = dict(out.get("streams", {}))
++            out["cache_restores"] = {name: dict(value) for name, value in out.get("cache_restores", {}).items()}
++        # DiskTier owns a separate thread-safe published view. Refresh it
++        # outside this lock so completed asynchronous writes appear while idle,
++        # without filesystem I/O or cache traversal on HTTP reads.
++        spill = self._disk_view(self._store)
++        if spill is None:
++            out.pop("spill", None)
++        else:
++            out["spill"] = spill
++        return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index eae3db732..4faf63c1e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -81,6 +81,20 @@ GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+ MAX_ROWS = deep_mod.ROWS
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ 
++def _telemetry_lone(engine, phase: str | None, *, prefill_done: int | None = None,
++                    generation: int | None = None) -> None:
++    """Best-effort bridge for host-only engine fakes that predate cache telemetry."""
++    metrics = getattr(engine, "cache_metrics", None)
++    if metrics is not None:
++        metrics.set_lone(phase, prefill_done=prefill_done, generation=generation)
++
++
++def _telemetry_restore(engine, source: str, tokens: int) -> None:
++    """Record an actual restore when this is a fully initialized engine."""
++    metrics = getattr(engine, "cache_metrics", None)
++    if metrics is not None:
++        metrics.record_restore(source, tokens)
++
+ 
+ def auto_f_most() -> int:
+     """GLM53_TF_AUTO_FDRAFTS (patches/0010): the most DFlash2 drafts a round of ``auto`` verifies, still cut where
+@@ -552,8 +566,27 @@ class GlmEngine:
+ 
+             self.batch = Batcher(self, n)
+         self.store = self._sessions()       # patches/0110
++        from .cachemetrics import CacheMetrics
++
++        self.cache_metrics = CacheMetrics(self)
++        if self.batch is not None:
++            self.cache_metrics.publish_batch(self.batch)
++        else:
++            self.cache_metrics.publish_lone()
+         fastboot.mark("engine ready (session store, batcher)")
+         dump_mod.arm()                      # patches/0430: records from here on (not the calibration passes)
++    
++    def telemetry_snapshot(self) -> dict[str, Any]:
++        """The CPU-only cache/scheduler view published at engine ownership boundaries."""
++        return self.cache_metrics.snapshot()
++    
++    def _telemetry_lone(self, phase: str | None, *, prefill_done: int | None = None,
++                        generation: int | None = None) -> None:
++        _telemetry_lone(self, phase, prefill_done=prefill_done, generation=generation)
++
++    def _telemetry_restore(self, source: str, tokens: int) -> None:
++        _telemetry_restore(self, source, tokens)
++    
+ 
+     def _sessions(self):
+         """patches/0110: the session store (``sessions.py``), or None (GLM53_TF_SESSION_GIB=0, the default).
+@@ -989,16 +1022,21 @@ class GlmEngine:
+         drafter = self.drafter if use_dflash else None
+         t0 = time.perf_counter()
+         store = getattr(self, "store", None)        # patches/0110
++        source = "slot" if hit is not None else "none"
+         if store is not None and sess is not None and sess.entry is not None:
+             # a stored session into the live caches; the live snapshots no longer match them
+             hit = store.restore(sess.entry, drafter)
+             self.cache = []
++            source = "ram"
+         elif store is not None and sess is not None and sess.disk is not None:
+             # patches/0250: a session read from disk into the live caches (None: a rank failed, both prefill cold)
+             hit = store.restore_disk(sess, drafter)
+             self.cache = []
++            source = "disk" if hit is not None else "none"
+         # a request writes the attention caches from its resume point on: every longer snapshot is overwritten
+         cut = len(hit.ids) if hit is not None else 0
++        _telemetry_restore(self, source, cut)
++        _telemetry_lone(self, "prefilling", prefill_done=cut, generation=0)
+         self.cache = [c for c in self.cache if len(c.ids) <= cut]
+         from . import pfgrid
+ 
+@@ -1056,7 +1094,17 @@ class GlmEngine:
+             if grid % 64 // pfgrid.B12X:
+                 stats["b12x"] = grid % 64 // pfgrid.B12X             # patches/0240: the b12x kernels it ran
+             stats["fast_prefill"] = getattr(self.e, "fast_rows", 0) or stats["fast_prefill"]   # patches/0085: its C
+-        on_tokens([first])
++        generated = 0
++
++        def emit(tokens: list[int]) -> Any:
++            nonlocal generated
++            generated += len(tokens)
++            _telemetry_lone(self, "decoding",
++                            prefill_done=int(getattr(getattr(getattr(self, "e", None), "st", None), "pos", 0)),
++                            generation=generated)
++            return on_tokens(tokens)
++
++        emit([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+         policy = decode_policy(code)
+@@ -1073,12 +1121,12 @@ class GlmEngine:
+             if self.e.lookup is not None:
+                 self.e.lookup.opt = self.e.depth
+         if policy is None:
+-            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
++            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=emit)
+         elif code[0] == LOOKUP_KIND:        # patches/0020: lookup drafts, MTP drafts in the rounds without a match
+             greedy = sampling is None or sampling.temperature <= 0
+             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+             res = auto_decode(self.e, None, first, max_tokens, sampling, choice=None, m_policy=m_policy,
+-                              f_policy=m_policy, stop_eos=stop_eos, on_tokens=on_tokens)
++                              f_policy=m_policy, stop_eos=stop_eos, on_tokens=emit)
+         elif auto:
+             greedy = sampling is None or sampling.temperature <= 0
+             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+@@ -1089,13 +1137,13 @@ class GlmEngine:
+                                        margin=margin)
+             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
+                               f_policy=DepthPolicy(self.f_most, fixed=True, confidence=0.3), stop_eos=stop_eos,
+-                              on_tokens=on_tokens)
++                              on_tokens=emit)
+         elif use_dflash:
+             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                                on_tokens=on_tokens)
++                                on_tokens=emit)
+         else:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+-                             on_tokens=on_tokens)
++                             on_tokens=emit)
+         self.e.depth = None                 # patches/0071: the optimizer is the request's
+         if draft and policy is not None and res.keeps and not grid:     # patches/0080: fast: no reply snapshot
+             committed = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+@@ -1234,6 +1282,7 @@ class GlmEngine:
+                     finally:
+                         self.e.constraint = None
+         except BaseException:
++            _telemetry_lone(self, None, prefill_done=0, generation=0)
+             if emitter is not None:
+                 emitter.close(raise_error=False)
+             raise
+@@ -1250,6 +1299,7 @@ class GlmEngine:
+             stats["verify_ms"] = [round(v, 2) for v in self.costs["verify"]]
+         if not values["prefill_rows"]:                  # patches/0085: the header carries "auto" as 0
+             stats["tf_knobs"]["prefill_rows"] = "auto"
++        _telemetry_lone(self, None, prefill_done=0, generation=0)
+         return stats
+ 
+     def follow(self) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessdisk.py b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 64f92c800..62f097469 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -641,6 +641,7 @@ class _Job:
+     event: Any
+     nbytes: int
+     keys: list = field(default_factory=list)       # every key the job writes (pending until it is done)
++    telemetry_done: bool = False
+ 
+ 
+ class _Writer:
+@@ -735,16 +736,16 @@ class _Writer:
+                 self.stream = torch.cuda.Stream(device=t.device)
+             t._run_job(arg, stream=self.stream)
+         elif kind == "del_entry":
+-            t._entry_path(arg).unlink(missing_ok=True)
++            t._delete_entry(arg)
+         elif kind == "del_page":
+-            t._page_path(arg).unlink(missing_ok=True)
++            t._delete_page(arg)
+         elif kind == "touch":
+             try:
+                 os.utime(t._entry_path(arg))
+             except OSError:
+                 pass
+         elif kind == "unlink":
+-            Path(arg).unlink(missing_ok=True)
++            t._unlink_path(Path(arg))
+         elif kind == "rmtree":
+             shutil.rmtree(arg, ignore_errors=True)
+ 
+@@ -787,12 +788,30 @@ class DiskTier:
+         self.rb = [sessions._nbytes(c.live[0]) for c in comps]
+         self.lay = {m: self._layout(m) for m in (True, False)}
+         self.index = DiskIndex(budget_bytes() if budget is None else budget, lambda m: self.lay[m][1])
++        self._telemetry_budget = self.index.budget
+         self.page_sha: dict[bytes, str] = {}           # rank-local: this rank's bytes
+         self.bad: set[bytes] = set()                   # rank-local: keys whose write failed
+         self.writer = _Writer(self)
++        # The writer and serving thread update this small, CPU-only view at completed lifecycle boundaries.  HTTP
++        # readers never inspect the index, writer queue, files, CUDA state, or restore buffers.
++        self._telemetry_lock = threading.Lock()
++        self._entry_sizes: dict[bytes, int] = {}
++        self._page_sizes: dict[bytes, int] = {}
++        self._stored_bytes = 0
++        self._pending_writes = 0
++        self._pending_write_bytes = 0
++        self._budget_used_bytes = 0
++        self._telemetry = {"written": 0, "written_bytes": 0, "loaded": 0, "loaded_bytes": 0,
++                           "loaded_tokens": 0, "write_failed": 0, "checksum_failed": 0, "load_failed": 0,
++                           "restore_failed": 0}
++        # Successful distributed restores are a bounded, rank-local observation window (most recent 256 samples).
++        self._restore_samples: deque[float] = deque(maxlen=256)
++        self._disk_free_bytes: int | None = None
++        self._refresh_disk_free()
+         self.stats = {"writes": 0, "write_bytes": 0, "write_s": 0.0, "pages_written": 0, "loads": 0, "load_bytes": 0,
+                       "load_s": 0.0, "pages_read": 0, "pages_skipped": 0, "failed_loads": 0}
+         self.last: dict = {}
++        self._last_load_duration = 0.0
+         self._stages: list = []
+         self._stage_lock = threading.Lock()
+         self._warned: set[str] = set()
+@@ -830,6 +849,124 @@ class DiskTier:
+         if not self.quiet:
+             print(f"[tensorfold] session disk (rank {self.rank}): {msg}", flush=True)
+ 
++    # -- CPU-only telemetry --------------------------------------------------------------------------------------
++    def _refresh_disk_free(self) -> None:
++        """Refresh capacity while doing tier work, never from an HTTP scrape."""
++
++        try:
++            st = os.statvfs(self.dir)
++        except OSError:
++            with self._telemetry_lock:
++                self._disk_free_bytes = None
++            return
++        with self._telemetry_lock:
++            self._disk_free_bytes = int(st.f_bavail * st.f_frsize)
++
++    def _write_submitted(self, job: _Job) -> None:
++        with self._telemetry_lock:
++            self._pending_writes += 1
++            self._pending_write_bytes += job.nbytes
++
++    def _publish_index_budget(self) -> None:
++        """Copy the index's charge at a mutation boundary; a scrape never reads the mutable index."""
++
++        used = self.index.used
++        with self._telemetry_lock:
++            self._budget_used_bytes = int(used)
++
++
++    def _write_complete(self, job: _Job, ok: bool) -> None:
++        """Publish one writer result after I/O; idempotent for inline submission failures."""
++
++        with self._telemetry_lock:
++            if job.telemetry_done:
++                return
++            job.telemetry_done = True
++            self._pending_writes -= 1
++            self._pending_write_bytes -= job.nbytes
++            if not ok:
++                self._telemetry["write_failed"] += 1
++        if not ok:
++            self._refresh_disk_free()
++            return
++        # This runs after the entry's os.replace.  These are the exact file lengths written by this format; avoid a
++        # second filesystem operation and do not consult the mutable index while the writer is completing.
++        entry_size = int(job.meta["data_off"]) + int(job.meta["data_bytes"])
++        page_sizes = {key: int(job.meta["stride"]) for key in job.keys[1:]}
++        with self._telemetry_lock:
++            previous = self._entry_sizes.get(job.key, 0)
++            self._entry_sizes[job.key] = entry_size
++            self._stored_bytes += entry_size - previous
++            for key, size in page_sizes.items():
++                previous = self._page_sizes.get(key, 0)
++                self._page_sizes[key] = size
++                self._stored_bytes += size - previous
++            self._telemetry["written"] += 1
++            self._telemetry["written_bytes"] += entry_size + sum(page_sizes.values())
++        self._refresh_disk_free()
++
++    def _write_failed_before_submit(self) -> None:
++        with self._telemetry_lock:
++            self._telemetry["write_failed"] += 1
++
++    def _delete_entry(self, key: bytes) -> None:
++        self._entry_path(key).unlink(missing_ok=True)
++        with self._telemetry_lock:
++            self._stored_bytes -= self._entry_sizes.pop(key, 0)
++        self._refresh_disk_free()
++
++    def _delete_page(self, key: bytes) -> None:
++        self._page_path(key).unlink(missing_ok=True)
++        with self._telemetry_lock:
++            self._stored_bytes -= self._page_sizes.pop(key, 0)
++        self._refresh_disk_free()
++
++    def _unlink_path(self, path: Path) -> None:
++        path.unlink(missing_ok=True)
++        self._refresh_disk_free()
++
++    def _load_finished(self, load: "_Load") -> None:
++        with self._telemetry_lock:
++            if load.error is None:
++                self._telemetry["loaded"] += 1
++                self._telemetry["loaded_bytes"] += int(load.bytes)
++            elif "checksum" in load.error.lower():
++                self._telemetry["checksum_failed"] += 1
++            else:
++                self._telemetry["load_failed"] += 1
++
++    def restore_succeeded(self, tokens: int, duration: float) -> None:
++        """Record a usable restore only after SessionStore's both-rank verdict."""
++
++        with self._telemetry_lock:
++            self._telemetry["loaded_tokens"] += int(tokens)
++            self._restore_samples.append(float(duration))
++
++    def restore_failed(self) -> None:
++        with self._telemetry_lock:
++            self._telemetry["restore_failed"] += 1
++
++    def telemetry_snapshot(self) -> dict:
++        """Return published rank-local state without I/O, CUDA, queue inspection, or synchronization."""
++
++        with self._telemetry_lock:
++            out = dict(self._telemetry)
++            out.update(gib=self._telemetry_budget / 2 ** 30, entries=len(self._entry_sizes),
++                       stored_bytes=self._stored_bytes,
++                       budget_used_bytes=self._budget_used_bytes,
++                       pending=self._pending_writes, pending_bytes=self._pending_write_bytes)
++            if self._disk_free_bytes is not None:
++                out["disk_free_bytes"] = self._disk_free_bytes
++            if self._restore_samples:
++                ordered = sorted(self._restore_samples)
++
++                def percentile(p: float) -> float:
++                    return ordered[round((len(ordered) - 1) * p)]
++
++                out["restore_ms_p50"] = percentile(.5) * 1000
++                out["restore_ms_p95"] = percentile(.95) * 1000
++            return out
++
+     def _tails(self, n: int, mtp_len: int, npages: int) -> list[tuple[int, int, int]]:
+         """(cache tensor, first row, end row) of the rows past the full pages (the private tail)."""
+ 
+@@ -897,13 +1034,17 @@ class DiskTier:
+         res = self.index.add(tag=tag, ids=ids, mtp_len=mtp_len, drafter=drafter, entry_bytes=eb,
+                              kind=getattr(src, "kind", "turn"))
+         self._forget(res.evicted, res.freed)
++        self._publish_index_budget()
+         if res.status == PRESENT:
+             self.writer.op("touch", res.entry.key)
+         elif res.status == ADDED:
+             try:
+                 self._write(res.entry, res.new, tails, snaps, snap, src)
+             except Exception as exc:  # noqa: BLE001 - e.g. no device memory to pack: the entry's read fails later
++                failed = res.entry.key in self.bad
+                 self.bad.add(res.entry.key)
++                if not failed:
++                    self._write_failed_before_submit()
+                 self._log(f"cannot write entry {res.entry.id}: {exc!r}")
+         return res
+ 
+@@ -1002,12 +1143,24 @@ class DiskTier:
+             if self.cuda:
+                 ev = torch.cuda.Event()
+                 ev.record(torch.cuda.current_stream(self.device))
+-            self.writer.submit(_Job(e.key, groups, segs, meta, ev, total, keys))
++            job = _Job(e.key, groups, segs, meta, ev, total, keys)
++            self._write_submitted(job)
++            try:
++                self.writer.submit(job)
++            except BaseException:
++                self._write_complete(job, False)
++                raise
+         else:                                           # larger than the queue: now, a group of pages at a time
+             g = self._group()
+             groups = [(new_keys[i:i + g], (lambda part=new[i:i + g]: self._pack(e, part, src)))
+                       for i in range(0, len(new), g)]
+-            self.writer.inline(_Job(e.key, groups, segs, meta, None, total, keys))
++            job = _Job(e.key, groups, segs, meta, None, total, keys)
++            self._write_submitted(job)
++            try:
++                self.writer.inline(job)
++            except BaseException:
++                self._write_complete(job, False)
++                raise
+ 
+     def _group(self) -> int:
+         return max(1, CHUNK // max(self.lay[True][1], 1))
+@@ -1121,8 +1274,10 @@ class DiskTier:
+             self.stats["writes"] += 1
+             self.stats["write_bytes"] += written
+             self.stats["write_s"] += time.perf_counter() - t0
++            self._write_complete(job, True)
+         except BaseException:
+             self.bad.add(job.key)
++            self._write_complete(job, False)
+             raise
+         finally:
+             self._stage_put(stage)
+@@ -1144,6 +1299,7 @@ class DiskTier:
+ 
+         snap = load.result()
+         dt = time.perf_counter() - load.t0
++        self._last_load_duration = dt
+         self.last = {"entry": load.entry.id, "tokens": len(load.entry.ids), "ok": snap is not None,
+                      "bytes": load.bytes, "s": round(dt, 4), "gbps": round(load.bytes / 1e9 / max(dt, 1e-9), 2),
+                      "pages_read": load.pages_read, "pages_skipped": load.pages_skipped, "threads": load.n_threads}
+@@ -1157,6 +1313,8 @@ class DiskTier:
+             self.stats["load_s"] += dt
+             self.stats["pages_read"] += load.pages_read
+             self.stats["pages_skipped"] += load.pages_skipped
++        self._load_finished(load)
++        self._refresh_disk_free()
+         return snap
+ 
+     def drop(self, entry: DiskEntry) -> None:
+@@ -1165,6 +1323,7 @@ class DiskTier:
+         if self.index.entries.get(entry.id) is entry:
+             e, freed = self.index.evict(entry.id, "dropped")
+             self._forget([e], freed)
++            self._publish_index_budget()
+ 
+     def touch(self, entry: DiskEntry) -> None:
+         if self.index.entries.get(entry.id) is entry:
+@@ -1260,8 +1419,30 @@ class DiskTier:
+             if k not in referenced:
+                 self.writer.op("unlink", p)
+         self._prune()
++        self._publish_index_budget()
++        self._recover_telemetry(local)
+         return len(self.index.entries)
+ 
++    def _recover_telemetry(self, local: dict[bytes, dict]) -> None:
++        """Publish physical sizes once after startup reconciliation, not at scrape time."""
++
++        entries, pages = {}, {}
++        for key in self.index.by_key:
++            meta = local.get(key)
++            if meta is None:
++                continue
++            try:
++                entries[key] = self._entry_path(key).stat().st_size
++                for page in meta["_keys"]:
++                    pages.setdefault(page, self._page_path(page).stat().st_size)
++            except OSError:
++                continue
++        with self._telemetry_lock:
++            self._entry_sizes = entries
++            self._page_sizes = pages
++            self._stored_bytes = sum(entries.values()) + sum(pages.values())
++        self._refresh_disk_free()
++
+     def _prune(self, keep: int = 2) -> None:
+         """Other compat directories of this rank beyond the ``keep`` newest go (another image / knob set)."""
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessions.py b/src/tensorfold/families/glm5_next/cuda/sessions.py
+index 1739baed5..9d4fa82a6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -1154,6 +1154,7 @@ class SessionStore:
+         snap = self.disk.finish_load(plan.load)
+         plan.load = None
+         if not self.disk.agree(snap is not None):
++            self.disk.restore_failed()
+             self.disk.drop(plan.disk)
+             self.live = {}
+             self.stats["disk_fallbacks"] = self.stats.get("disk_fallbacks", 0) + 1
+@@ -1162,6 +1163,7 @@ class SessionStore:
+         if drafter is not None and snap.window is not None:
+             restore_window(drafter, snap.window)
+         self.disk.touch(plan.disk)
++        self.disk.restore_succeeded(len(plan.disk.ids), self.disk._last_load_duration)
+         self.stats["disk_restores"] = self.stats.get("disk_restores", 0) + 1
+         return snap
+ 

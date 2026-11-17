@@ -1,0 +1,136 @@
+--- a/engines/tensorfold.py
++++ b/engines/tensorfold.py
+@@ -31,7 +31,7 @@
+ HEALTH_COUNTERS = [
+     "requests_total", "prompt_tokens_total", "completion_tokens_total",
+     "cached_tokens_total", "rounds_total", "drafted_total", "accepted_total",
+-    "prefill_seconds_total", "decode_seconds_total",
++    "prefill_seconds_total", "decode_seconds_total", "prefilled_tokens_total",
+     "pool_tokens", "pool_free_tokens", "kept_prompts", "context_length",
+ ]
+ 
+@@ -41,7 +41,7 @@
+ SPILL_FIELDS = [
+     "gib", "entries", "stored_bytes", "written", "written_bytes", "loaded",
+     "loaded_bytes", "loaded_tokens", "restore_ms_p50", "restore_ms_p95",
+-    "write_failed", "crc_failed", "load_failed", "load_unfit", "disk_free_bytes",
++    "write_failed", "checksum_failed", "load_failed", "disk_free_bytes",
+ ]
+ 
+ 
+@@ -54,6 +54,9 @@
+         s[k] = get_value(metrics, k)
+     for k in HEALTH_COUNTERS:
+         s[k] = float(health.get(k, 0) or 0)
++    s["prefill_present"] = "prefilled_tokens_total" in health
++    s["pool_present"] = all(k in health for k in ("pool_tokens", "pool_free_tokens"))
++    s["stream_kv_present"] = "tensorfold:kv_cache_usage_ratio" in metrics
+     # generation tokens only exist as a /metrics counter (health has completion_tokens_total)
+     s["generation_tokens_total"] = get_value(metrics, "tensorfold:generation_tokens_total")
+     streams = health.get("streams", {}) or {}
+@@ -62,11 +65,19 @@
+     s["kept_bytes"] = float(health.get("kept_bytes", 0) or 0)
+     spill = health.get("spill") or {}
+     s["spill_present"] = bool(spill)
++    s["spill_fields"] = frozenset(spill)
+     for k in SPILL_FIELDS:
+         s[f"spill_{k}"] = float(spill.get(k, 0) or 0)
+     s["busy"] = bool(health.get("busy", False))
+     s["ok"] = bool(health.get("ok", False))
+     return s
++
++
++def spill_value(cur, field, formatter=str):
++    """Unsupported tier fields are unknown, not zero."""
++    if field not in cur.get("spill_fields", ()):
++        return "—"
++    return formatter(cur[f"spill_{field}"])
+ 
+ 
+ def tick(stdscr, args, state):
+@@ -125,13 +136,15 @@
+ 
+     # ---- Live throughput (delta-sampled) ----
+     # engine-time rates (finished-request based, health counters mirror /metrics)
+-    pp_engine_rate = rate(cur, prev, "prompt_tokens_total", "prefill_seconds_total")
++    pp_engine_rate = rate(cur, prev, "prefilled_tokens_total", "prefill_seconds_total") \
++        if cur.get("prefill_present") and prev and prev.get("prefill_present") else None
+     tg_engine_rate = rate(cur, prev, "generation_tokens_total", "decode_seconds_total")
+     # live wall rates (completion_tokens_total includes in-flight replies)
+     tg_live = wall_rate(cur, prev, "completion_tokens_total")
+     pp_live = wall_rate(cur, prev, "prompt_tokens_total")
+     # window averages
+-    pp_eng_avg = avg_rate(history, "prompt_tokens_total", "prefill_seconds_total")
++    pp_eng_avg = avg_rate(history, "prefilled_tokens_total", "prefill_seconds_total") \
++        if len(history) > 1 and all(s.get("prefill_present") for s in (history[0], history[-1])) else None
+     tg_eng_avg = avg_rate(history, "generation_tokens_total", "decode_seconds_total")
+     tg_live_avg = avg_wall_rate(history, "completion_tokens_total")
+ 
+@@ -179,15 +192,22 @@
+     ctx = int(cur["context_length"])
+     cache_color = COLOR_GREEN if used_pct < 70 else COLOR_WARN if used_pct < 90 else COLOR_RED
+     spill = bool(cur.get("spill_present"))
++    pool_text = f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}" \
++        if cur.get("pool_present") else "unavailable"
++    stream_text = f"{kv_ratio:.1f}% (max live position / ctx window)" \
++        if cur.get("stream_kv_present") else "unavailable"
+ 
+     draw_box_start(stdscr, y, x, width, "Live Cache")
+     y += 1
+-    draw_bar_row(stdscr, y, x, "Pool occupancy:", used_pct, width, cache_color)
++    if cur.get("pool_present"):
++        draw_bar_row(stdscr, y, x, "Pool occupancy:", used_pct, width, cache_color)
++    else:
++        draw_row(stdscr, y, x, "Pool occupancy:", "unavailable", width)
+     y += 1
+     if not spill:
+-        draw_row(stdscr, y, x, "Pool:", f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}", width)
+-        y += 1
+-        draw_row(stdscr, y, x, "Stream KV ratio:", f"{kv_ratio:.1f}% (per-stream / ctx window)", width)
++        draw_row(stdscr, y, x, "Pool:", pool_text, width)
++        y += 1
++        draw_row(stdscr, y, x, "Stream KV ratio:", stream_text, width)
+         y += 1
+         draw_row(stdscr, y, x, "Kept prompts:", f"{kept}   context window {format_num(ctx)}", width)
+         y += 1
+@@ -213,31 +233,32 @@
+         loaded = f"{cur['spill_loaded_bytes'] / 2 ** 30:.2f} GiB · {format_num(cur['spill_loaded_tokens'])} tok"
+         if l_rate:
+             loaded += f" (+{format_num(l_rate)}/s)"
+-        fails = (int(cur["spill_write_failed"]), int(cur["spill_crc_failed"]),
+-                 int(cur["spill_load_failed"]), int(cur["spill_load_unfit"]))
+-        fail_color = COLOR_GREEN if not any(fails) else COLOR_RED
++        fail_fields = ("write_failed", "checksum_failed", "load_failed")
++        fails = [spill_value(cur, field, lambda n: str(int(n))) for field in fail_fields]
++        fail_color = COLOR_RED if any(cur.get(f"spill_{field}", 0) for field in fail_fields) else COLOR_GREEN
+         draw_two_col_row(stdscr, y, x, width, "RAM pool", "", "SSD spill tier (streaming)", "",
+                          left_label_color=COLOR_HEADER, right_label_color=COLOR_HEADER)
+         y += 1
+         draw_two_col_row(stdscr, y, x, width, "Pool:",
+-                         f"{format_num(pool - free)} / {format_num(pool)} rows free {format_num(free)}",
++                         pool_text,
+                          "Stored:", f"{stored / 2 ** 30:.1f} GiB ({entries} entries)")
+         y += 1
+         draw_two_col_row(stdscr, y, x, width, "Kept prompts:", f"{kept} ({format_bytes(cur.get('kept_bytes', 0.0))})",
+                          "Written:", written)
+         y += 1
+-        draw_two_col_row(stdscr, y, x, width, "Stream KV ratio:", f"{kv_ratio:.1f}% (per-stream / ctx window)",
++        draw_two_col_row(stdscr, y, x, width, "Stream KV ratio:", stream_text,
+                          "Loaded:", loaded)
+         y += 1
+         draw_two_col_row(stdscr, y, x, width, "Context window:", format_num(ctx),
+-                         "Restore p50/p95:", f"{cur['spill_restore_ms_p50']:.1f} / {cur['spill_restore_ms_p95']:.1f} ms")
++                         "Restore p50/p95:", " / ".join(spill_value(cur, field, lambda n: f"{n:.1f}")
++                                                      for field in ("restore_ms_p50", "restore_ms_p95")) + " ms")
+         y += 1
+         draw_two_col_row(stdscr, y, x, width, "", "",
+-                         "Failures:", f"write {fails[0]} · crc {fails[1]} · load {fails[2]} · unfit {fails[3]}",
++                         "Failures:", f"write {fails[0]} · checksum {fails[1]} · load {fails[2]}",
+                          right_value_color=fail_color)
+         y += 1
+         draw_two_col_row(stdscr, y, x, width, "", "",
+-                         "Disk free:", format_bytes(cur["spill_disk_free_bytes"]))
++                         "Disk free:", spill_value(cur, "disk_free_bytes", format_bytes))
+         y += 1
+         if spill_hist is not None and len(spill_hist) >= 2:
+             pts = [r[1] for r in spill_hist]

@@ -108,6 +108,38 @@ curl -s $B/v1/chat/completions -H 'Content-Type: application/json' -d '{
   object (rounds, drafted and accepted tokens). `usage.prompt_tokens_details.cached_tokens` shows a session hit.
 - `/health` and `/metrics` (Prometheus) on the same port (patch 0150).
 
+### Metrics and EngineMetrics
+
+Patch 0710 adds native `tensorfold:*` metrics alongside the existing `tensorfold_*` operational families:
+
+```bash
+curl -s "$B/metrics"
+curl -s "$B/health"
+```
+
+EngineMetrics consumes both endpoints. `/health` now includes actual pool capacity/free/mapped/reserved/available
+positions, RAM-session retention and an optional `spill` object. Pool occupancy is not live context usage:
+`kv_pool_usage_ratio` can remain nonzero while the idle `kv_cache_usage_ratio` is zero. Reservations additionally
+reduce admission-available space without mapping pages. Neither ratio is CUDA allocation utilization.
+
+SSD bytes/free space are local to the serving rank. Stored file bytes exclude pending writes and deduplicate shared
+page files; budget charge is separate. Successful local reads and usable distributed restores are separate too:
+`spill.loaded_tokens` increases only after both ranks agree. Restore latency p50/p95 use the last 256 successful
+distributed restores. Fields unavailable for an engine/configuration are omitted, not invented as zeros.
+
+The optional `tools/enginemetrics-glm-metrics.patch` targets the separate consumer's `engines/tensorfold.py`.
+It fixes uncached-prefill throughput, SHA-256 checksum naming and unavailable-field display. Applying it changes
+that external checkout; review/approve that separately:
+
+```bash
+git -C /path/to/EngineMetrics apply /path/to/glm53-tensorfold-spark/tools/enginemetrics-glm-metrics.patch
+python3 /path/to/EngineMetrics/engine_metrics.py --engine tensorfold --host 127.0.0.1 --port 8000
+```
+
+Use the port actually configured for this deployment. The consumer prefers the reported `spill.gib` over an old
+`--spill-cap` fallback. No new port, exporter, authentication or binding change is required. Rebuild/deploy the
+image in an approved maintenance window before expecting these additions from an existing running container.
+
 ### Reasoning effort
 
 Thinking is on by default. In the prod configs `GLM53_TF_DEFAULT_EFFORT=high` and `GLM53_TF_EFFORT_FIELD=1`:

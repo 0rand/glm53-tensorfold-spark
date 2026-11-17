@@ -377,18 +377,30 @@ def test_pooled_slots_with_the_disk_tier(monkeypatch, tmp_path, fast):
     from test_batch_sessions_patches import _conversations
 
     from tensorfold.families.glm5_next.cuda import sessdisk
+    from tensorfold.families.glm5_next.cuda.cachemetrics import CacheMetrics
 
     bat = _pool_batcher(monkeypatch, npages=8, fast=fast, budget_pages=20.0)
     tier = sessdisk.DiskTier(bat.store, tmp_path, 0, {"pool": 1, "fast": fast}, budget=1 << 40, min_tok=64, gain=0,
                              n_threads=3, quiet=True)
     tier.reconcile()
     bat.store.attach_disk(tier)
+    bat.g.limit = bat.states[0].capacity
+    bat.g.cache_metrics = CacheMetrics(bat.g)
+    bat.g.cache_metrics.publish_batch(bat)
     stats = _conversations(bat, rng=np.random.default_rng(23 + int(fast)), fast=fast, rows=64, turns=10)
     from_disk = [s for s in stats if s.get("restored_disk")]
     assert from_disk and all(s["disk"]["ok"] for s in from_disk)
     assert bat.counts["pool_spills"] > 0
     tier.writer.drain()
     _pool_accounting(bat)
+    view = bat.g.cache_metrics.snapshot()
+    assert view["pool_used_tokens"] > 0
+    assert view["pool_used_tokens"] + view["pool_free_tokens"] == view["pool_tokens"]
+    assert view["pool_kept_tokens"] == view["pool_used_tokens"]
+    assert view["pool_reserved_tokens"] == 0
+    assert view["stream_kv_usage_ratio"] == 0 and view["requests_running"] == 0
+    assert view["spill"]["loaded_tokens"] > 0 and view["spill"]["written"] > 0
+    assert view["spill"]["pending"] == 0
 
 
 # -- GPU ------------------------------------------------------------------------------------------------------------

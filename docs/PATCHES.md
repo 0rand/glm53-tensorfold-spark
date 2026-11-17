@@ -83,6 +83,7 @@ what upstream serves (plus the GLM tool-call parser, which only adds a format up
 | 0680 `glm-assistant-ends` | `GLM53_TF_ASSISTANT_ENDS=0\|1` (both ranks, checked) | `1` | GLM's `<\|assistant\|>` role token ends a reply, like the checkpoint's `<\|endoftext\|>`, `<\|user\|>` and `<\|observation\|>`: at high reasoning effort the model sometimes wrote it mid-answer and started a second answer, and the raw token reached the client. Its id is read from the checkpoint's `tokenizer.json` by content (special tokens only; 154828 on the served checkpoint) and appended to `Config.eos` (new torch-free `glm5_next/cuda/ends.py`, called by `weights.Config.read`), which every decode loop, the batcher and its device accept kernel, prompt-lookup drafts, 0610's grammar and the server's text / `finish_reason` read. The engine all-gathers (count, sum) of the list at load and refuses to start when the ranks differ. `0` keeps the checkpoint's list; any other value is a ValueError at load. No tokenizer.json, or no such special token: the list is unchanged. Semantics from MiaAI-Lab recipe patch 0075 (issue #60, Apache-2.0), re-implemented. Host tests: `tests/test_assistant_ends.py` (runs the real `Config.read` on the checkpoint's config.json + tokenizer.json, with torch / triton mocked where absent). |
 | 0690 `glm-open-tool-calls` | `GLM53_TF_TOOL_FIXES` names `opencalls`, `argkeys` (0620's knob; rank 0) | off; on with `all` | `opencalls`: when the model's end token (not a stop string, not the token limit) ends the answer inside a GLM `<tool_call>` with no `</tool_call>`, the call is returned with `finish_reason: tool_calls` only when it is complete but for that tag: no argument value open (the model wrote every `</arg_value>` itself; a value is never closed here), one whole call to an offered tool (a name, then only `<arg_key>` / `<arg_value>` pairs), and every parameter in the tool's `required` present after the optional `argkeys` repair (a bare name: only a tool that requires none). Only `</tool_call>` is ever added. Anything else stays the reply's text, as before, and nothing runs. Fail-closed on purpose: a value cut mid-string (a shell command, a path) executed as a call is the dangerous case, so a truncated call is never completed by guessing. This tree never dropped that markup: the non-streamed `content` and the streamed final delta carried it, with `finish_reason: stop`. A call the token limit cut, and a reply a stop string ended, are unchanged; 0160's stop strings never match a call's markup, so one written inside the call does not stop it. Streamed and non-streamed replies take the same result (`App.run`). `argkeys`: a GLM call whose `<arg_key>` the model left out (`read path</arg_key>...`) gets it back before parsing (`repair_glm_keys`, copied from Mia); before, the block came back as text. Semantics from MiaAI-Lab recipe patch 0055 (issue #22, Apache-2.0), narrowed: 0055 also closes an open value and does not check `required`; its streaming call parser part has no counterpart here (this tree sends calls at the end only). Host tests: `tests/test_tool_fixes.py` (fake engine through the real `App.run`). |
 | 0700 `glm-tokenize-nogil` | none | - | The prompt is tokenized with Python's GIL released. HF tokenizers' `encode` holds the GIL for the whole text (~1.2 us a token), so a long prompt tokenized on its request thread stalls the `glm-batch` engine thread and every other stream; `encode_batch_fast` on the one text returns the same ids with the GIL released (the binding calls `py.allow_threads`) and without the character offsets nothing here reads. Three call sites: `PromptTokens._full` (0210; a cold prompt in full, a cached prompt's tail), `App.tokenize` (0490; `POST /tokenize`), and `App.prompt_ids` (0210; unreachable for GLM, routed through the same helper `App._encode_ids`). Needs `tokenizers` >= 0.20 (the image's `transformers` 5.17.0 pins >= 0.23.1). Host only, no engine, kernel or token change. Idea from MiaAI-Lab recipe patch 0099 (Apache-2.0; its CHANGELOG credits BadAd84), re-implemented: 0099 does not apply here, and its vision, forced-think-close and call-gate hunks have no counterpart. In production on two GB10s since 2026-10-20. Tests: `tests/test_tokenize_nogil.py` (a tokenizer whose `encode` fails, through the three call sites). |
+| 0710 `glm-engine-metrics` | none | on | Native `tensorfold:*` request histograms/counters and EngineMetrics-compatible `/health` cache/session fields, alongside the existing 13 `tensorfold_*` operational families. CPU-published scheduler/KV/RAM snapshots; committed, deduplicated local SSD bytes, pending writes, SHA-256 failures and distributed restore outcomes. No CUDA work or filesystem scans on scrape; no inference/configuration changes. See section 0710 below. |
 
 ## 0001 — EXL3 non-expert weights in 4 bits
 
@@ -3818,10 +3819,62 @@ a tokenizer dir). With it on, W20's gates passed: exact, batchexact, reply sha, 
 schemas / tools. tool-eval-bench against production (thinking off, temperature 0, one run): final score 90, category C
 (multi-step chains) 8/8; spark-bench was stopped early and is not a score (docs/RESULTS.md "W20").
 
+## 0710 — EngineMetrics, cache snapshots and SSD telemetry
+
+The CUDA server now serves native `tensorfold:*` metrics and the existing `tensorfold_*` watchdog families on
+the same `/metrics` endpoint. The latter retain their accounting; native generated-token totals are finished-request
+totals, while `/health.completion_tokens_total` includes running requests. `/health.prefilled_tokens_total` counts
+uncached prompt tokens from successful requests with prefill statistics, for an honest prefill-rate numerator.
+
+Request tickets begin before inference-body parsing and validation. Exactly one terminal status/outcome is
+recorded for success, refusal, failure or cancellation; a streamed engine error remains HTTP 200 with outcome
+`error`. TTFT ends at the first generated-token callback, not the role-only SSE prelude. Histograms cover request
+latency, TTFT, request prefill/decode duration and request-average time per output token. Missing token phases
+are not observed as zero. Duration buckets extend to 3,600 seconds before `+Inf`.
+
+`cachemetrics.CacheMetrics` publishes scheduler-owned CPU snapshots. Queue submissions update only the waiting
+gauge under the queue lock; full publication uses the same queue-to-telemetry lock order. HTTP reads do not walk
+mutable cache/session tables or launch CUDA/collective work. Pool quantities are separate:
+
+- `pool_used_tokens` / `pool_free_tokens`: mapped / physically unallocated page positions.
+- `pool_reserved_tokens`: outstanding admission promises; `pool_available_tokens` subtracts these from free space.
+- `pool_kept_tokens`: idle slots' retained pool pages; separate RAM snapshots use `kept_bytes` and session budget/usage.
+- `kv_pool_usage_ratio`: mapped positions / actual pool capacity.
+- `kv_cache_usage_ratio{pool="0"}`: maximum completed live context / context limit; zero when idle, even with retained pages.
+
+The SSD tier publishes `/health.spill` and native `spill_*` families. `stored_bytes` counts successfully committed
+entry/page files once per physical file; `budget_used_bytes` is the index charge, including pending writes.
+`pending` / `pending_bytes` describe outstanding writes. `loaded` / `loaded_bytes` count successful local reads,
+but `loaded_tokens` increments only after the existing both-rank restore verdict succeeds. `restore_failed`
+also exposes a peer-side failure after a successful local read. SHA-256 failures are `checksum_failed`, not CRC.
+Physical bytes and filesystem free space are rank-0-local, not pair totals. Free space refreshes during tier
+activity; scrapes never perform I/O or wait for the writer. Restore p50/p95 cover the most recent 256 successful
+distributed restores on this process; they are omitted before the first observation and are not mergeable histograms.
+Unsupported pool/tier fields are omitted rather than reported as an empty working cache.
+
+`tools/enginemetrics-glm-metrics.patch` adapts the separate EngineMetrics consumer: use the uncached prefill
+counter, display checksum failures accurately, and distinguish unavailable cache/tier fields from zero.
+It is not applied to an external checkout by the image build. See `docs/TRYING.md`.
+
+Verification includes the real HTTP handler and a real curses client, real CPU session-store/disk-tier
+round trips, slot/RAM/SSD reuse and SSD recovery after restart, with deterministic generated tokens equal to
+fresh prefill. This does not establish production-model GPU overhead or a GPU exactness campaign.
+
+In the isolated CPU HTTP smoke, 40 GETs per endpoint with Python allocation tracing enabled gave:
+
+| Endpoint | p50 (ms) | p95 (ms) |
+| --- | --- | --- |
+| `/health` | 1.509 | 2.062 |
+| `/metrics` | 2.270 | 2.576 |
+
+Traced Python allocations after these 80 GETs were 23,101 bytes current / 104,683 bytes peak.
+These are local CPU-harness observations, not production GPU overhead bounds.
+
 ## Tests
 
 | File | What it checks |
 | --- | --- |
+| `tests/test_metrics.py`, `tests/test_cachemetrics.py` | 0710: terminal accounting, real SSE TTFT boundary, optional phases, long-duration cumulative histograms, finished/live cohorts, pool reservation invariants, detached concurrent snapshots and queue-publication ordering. SSD lifecycle assertions extend `tests/cuda/test_session_disk_patches.py`: pending versus committed writes, shared-page deduplication, recovery, checksums, writer failures and asymmetric-rank restore failure. |
 | `tests/cuda/test_patches.py` | on TensorFold's synthetic GLM checkpoint (one GPU playing rank 0 of two): non-expert weights really are 4-bit; q4 drafted == serial (sampled and greedy); 64- vs 512-row prefill give the same reply and the same resume; the MSE clip is never worse than min/max; vectorized sparse selection equals the per-row loop at the dense/sparse boundary; a 3,000-token prompt (past the 2,051 dense limit) gives the same reply with 64- and 512-row chunks and with drafting |
 | `tests/cuda/test_longctx_patches.py` | 0050: bounded and device selection == unbounded (random, tied, signed-zero scores); the device selection replays in a graph across its bucket; long-context graph steps (rows 1-8, both parities, MTP 1-8) == upstream eager logits at 2.5k-7k tokens (contexts 4,096 / 8,192); replies with graphs == `GLM53_TF_LONGCTX_GRAPHS=0`, serial and drafted (8 policies), greedy and sampled, including a prompt crossing 2,051 during decode; resume after a long reply == fresh prefill |
 | `tests/cuda/test_latent_patches.py` | 0060: latent vs expanded kernels and an fp32 reference on the real shapes (32 heads, 256, latent 512; 4-bit and BF16 kv_b); window rows == serial rows bit for bit (dense, sparse, graph-style chunk counts); scratch independent of capacity; with `GLM53_TF_LATENT_KV=1`: latent caches and bytes a token, drafted == serial (11 policies), resumed == fresh, 64 vs 512-row prefill same state, BF16 kv_b (EXL3), a 3,000-token prompt past the dense limit (chunks, drafting, resume), batched == alone; latent vs expanded prefill within bf16 tolerance |

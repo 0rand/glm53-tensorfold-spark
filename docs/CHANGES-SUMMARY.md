@@ -16,6 +16,20 @@ kernel timings, a microbenchmark or arithmetic, not an end-to-end A/B. **Status*
 configs (`config/prod*.env.example`); *batch* = on in the batch configs (production and 4 x 256k) only; *single* = single-stream config only;
 *opt-in* = off unless you set it; *rejected* = tried, measured, left off; *superseded* / *tool* as noted.
 
+## Metrics enhancement (2026-11-17, patch 0710)
+
+- Added EngineMetrics-native request counters, five latency histograms and published scheduler/KV/RAM snapshots,
+  while preserving the existing operational metric names and accounting.
+- Added SSD committed-file, pending-write, local I/O, checksum-failure and distributed-restore telemetry to both
+  `/health` and `/metrics`. Shared page files are counted once; index budget charge is distinct from physical bytes.
+- Added a portable consumer patch for uncached-prefill throughput and honest unavailable/checksum displays.
+- CPU runtime proof used real HTTP/curses surfaces and real session/disk storage with the deterministic model harness:
+  cold, slot, RAM, SSD and restart restores matched fresh-prefill output. Production was not rebuilt or restarted;
+  no production-model GPU performance/exactness result is claimed.
+- Focused CPU regression run: 361 passed, 40 GPU-only cases skipped. One installed AnyIO pytest-plugin deprecation
+  warning; no product failures. Additional pooled-scheduler HTTP smoke exercised real mapped-page allocation,
+  RAM/SSD eviction and restore: retained pool occupancy remained visible while idle live-context usage was zero.
+
 ## Update W20 (2026-09-30: patch 0620, test window W20)
 
 Since the W19 update, one patch was added (0620, 77 in total) and one GPU campaign run (W20; `docs/RESULTS.md` W20,

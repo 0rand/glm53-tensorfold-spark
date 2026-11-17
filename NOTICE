@@ -23,6 +23,31 @@ TensorFold
   totals; each ported piece names its source commit, and docs/UPSTREAM-PORTS.md lists our changes to them.
   Those ported pieces stay under TensorFold's MIT License.
 
+0rand metrics enhancement (patches/0710)
+  Native metric names and the cache/session monitoring contract follow the DeepSeek TensorFold-ZIG and
+  Gilesco TensorFold stacks. The Python request recorder, published GLM cache snapshots and SSD lifecycle
+  instrumentation are independently implemented for this repository's pinned, patched TensorFold engine.
+  No kernels, inference settings or cache file formats are changed.
+
+EngineMetrics consumer integration (tools/enginemetrics-glm-metrics.patch)
+  The portable patch modifies EngineMetrics' TensorFold adapter; its original code and quoted diff context
+  remain under the following MIT License. The external consumer is not installed or modified by this build.
+
+  Copyright (c) 2026 xraan
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+  documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+  to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or substantial portions
+  of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+  THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 GLM-5.3-Flash EXL3 2x DGX Spark serving kits (patches/0170)
   Reederey87/glm53-flash-exl3-2x-dgx-spark (https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark,
   commit 6c337d2), Apache License 2.0, itself based on the kit by Mia's AI Lab

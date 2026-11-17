@@ -208,6 +208,32 @@ def _post(url, body):
         return e.code, e.read().decode()
 
 
+def _post_raw(url, body, path="/v1/chat/completions"):
+    req = urllib.request.Request(url + path, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def test_malformed_inference_bodies_are_terminal_refusals_but_tokenize_is_not(serve):
+    class TokenApp(FakeApp):
+        def tokenize(self, body):
+            return [1]
+
+        def context_limit(self):
+            return None
+
+    base = serve(TokenApp("basic", ok_result))
+    assert _post_raw(base, b"{")[0] == 400
+    assert _post_raw(base, b"[]")[0] == 400
+    assert _post_raw(base, b"{}", "/tokenize")[0] == 200
+    code, text = _get(base + "/metrics")
+    assert code == 200 and 'tensorfold:requests_total{status="400",outcome="refused"} 2' in text
+    assert 'status="200",outcome="success"' not in text
+
+
 def test_handler_health_metrics_and_errors(serve):
     app = FakeApp("strict", ok_result)
     base = serve(app)
@@ -232,6 +258,12 @@ def test_handler_health_metrics_and_errors(serve):
     app.engine.behaviour = ok_result
     code, text = _post(base, {"messages": []})       # strict: refused up front after the fatal error
     assert code == 503 and "restart both ranks" in text
+    code, text = _get(base + "/metrics")
+    assert code == 200
+    assert 'tensorfold:requests_total{status="200",outcome="success"} 1' in text
+    assert 'tensorfold:requests_total{status="400",outcome="refused"} 1' in text
+    assert 'tensorfold:requests_total{status="500",outcome="error"} 1' in text
+    assert 'tensorfold:requests_total{status="503",outcome="refused"} 1' in text
 
 
 def test_handler_stream_error_event(serve):
@@ -242,3 +274,5 @@ def test_handler_stream_error_event(serve):
     assert events[-1] == "[DONE]" and "NCCL" in json.loads(events[-2])["error"]["message"]
     code, text = _get(base + "/health")
     assert code == 200 and json.loads(text)["ok"] is False      # basic: reported, still 200
+    code, text = _get(base + "/metrics")
+    assert code == 200 and 'tensorfold:requests_total{status="200",outcome="error"} 1' in text
